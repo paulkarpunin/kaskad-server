@@ -43,7 +43,7 @@ load_tg_config() {
 prepare_system() {
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
         if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]]; then
-            curl -sL "https://raw.githubusercontent.com/paulkarpunin/server-kaskad/main/install.sh" -o "/usr/local/bin/gokaskad"
+            curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "/usr/local/bin/gokaskad"
         else
             cp -f "$0" "/usr/local/bin/gokaskad"
         fi

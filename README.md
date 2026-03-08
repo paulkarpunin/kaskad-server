@@ -34,7 +34,7 @@
 Подключитесь к вашему VPS (Ubuntu/Debian) под пользователем `root` и выполните одну команду:
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/anten-ka/kaskad/main/install.sh && chmod +x install.sh && ./install.sh
+wget -O install.sh https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh && chmod +x install.sh && ./install.sh
 ```
 
 ### ⚡ Последующие запуски
@@ -65,37 +65,3 @@ gokaskad
 2. В настройках соединения найдите поле **Endpoint / Адрес сервера**.
 3. **Замените** зарубежный IP-адрес на **IP-адрес этого сервера**.
 4. Сохраните настройки и подключитесь. Готово!
-
----
-
-## 🤝 Партнеры и Промокоды
-
-Хостинги, которые мы рекомендуем для создания каскадных серверов:
-
-**🌍 Локации: РФ и Европа**
-* **Ссылка для регистрации:** [https://vk.cc/ct29NQ](https://vk.cc/ct29NQ)
-
-| Промокод | Описание бонуса |
-| :--- | :--- |
-| `OFF60` | **60% скидка** на первый месяц аренды |
-| `antenka20` | Буст **+20%** к балансу (+3% при оплате за 3 мес) |
-| `antenka6` | Буст **+15%** к балансу (+5% при оплате за 6 мес) |
-| `antenka12` | Буст **+5%** к балансу (+5% при оплате за 12 мес) |
-
-**🇧🇾 Локация: Беларусь**
-* **Ссылка для регистрации:** [https://vk.cc/cUxAhj](https://vk.cc/cUxAhj)
-
-| Промокод | Описание бонуса |
-| :--- | :--- |
-| `OFF60` | **60% скидка** на первый месяц аренды |
-
----
-
-## 🔗 Полезные ссылки
-
-* **YouTube канал:** [https://www.youtube.com/@antenkaru](https://www.youtube.com/@antenkaru)
-* **Инструкции (Boosty):** [https://boosty.to/anten-ka](https://boosty.to/anten-ka)
-* **Все ссылки (Taplink):** [https://antenka.taplink.ws](https://antenka.taplink.ws)
-* **Поддержка (Tribute):** [https://web.tribute.tg/p/cJu](https://web.tribute.tg/p/cJu)
-
-> 💰 **Поддержать автора донатом:** [CloudTips (pay.cloudtips.ru)](https://pay.cloudtips.ru/p/7410814f)

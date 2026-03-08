@@ -35,7 +35,6 @@ validate_ipv4() {
 
 # --- ПОДГОТОВКА СИСТЕМЫ ---
 prepare_system() {
-    # 1. Интеграция бинарного файла (с защитой от потокового сбоя)
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
         if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]]; then
             curl -sL "https://raw.githubusercontent.com/paulkarpunin/server-kaskad/main/install.sh" -o "/usr/local/bin/gokaskad"
@@ -45,21 +44,20 @@ prepare_system() {
         chmod +x "/usr/local/bin/gokaskad"
     fi
 
-    # Создание рабочей директории
     mkdir -p "$CONFIG_DIR"
 
-    # 2. Изолированная настройка ядра
     local SYSCTL_FILE="/etc/sysctl.d/99-gokaskad.conf"
-    cat <<EOF > "$SYSCTL_FILE"
+    if [[ ! -f "$SYSCTL_FILE" ]]; then
+        cat <<EOF > "$SYSCTL_FILE"
 net.ipv4.ip_forward=1
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-    sysctl --system > /dev/null 2>&1
+        sysctl --system > /dev/null 2>&1
+    fi
 
-    # 3. Интеллектуальное разрешение зависимостей
     export DEBIAN_FRONTEND=noninteractive
-    local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "qrencode" "curl")
+    local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "curl")
     local MISSING_PKGS=""
 
     for pkg in "${REQUIRED_PKGS[@]}"; do
@@ -69,107 +67,137 @@ EOF
     done
 
     if [[ -n "$MISSING_PKGS" ]]; then
-        echo -e "${YELLOW}[*] Инсталляция системных зависимостей:$MISSING_PKGS${NC}"
+        echo -e "${YELLOW}[*] Инсталляция зависимостей:$MISSING_PKGS${NC}"
         apt-get update -y > /dev/null
         apt-get install -y $MISSING_PKGS > /dev/null
     fi
 }
 
-# --- МОДУЛЬ WATCHDOG (ФОНОВЫЙ АНАЛИЗАТОР) ---
+# --- МОДУЛЬ WATCHDOG (ФОНОВЫЙ ТЕЛЕМЕТРИСТ) ---
 run_watchdog() {
-    # Проверка наличия конфигурации
-    if [[ ! -f "$WATCHDOG_CONF" ]]; then exit 0; fi
-    source "$WATCHDOG_CONF"
+    local TUNNEL_ID="$1"
+    local THRESHOLD="$2"
     
+    [[ -z "$TUNNEL_ID" || -z "$THRESHOLD" ]] && exit 0
+    [[ ! -f "$WATCHDOG_CONF" ]] && exit 0
+    
+    source "$WATCHDOG_CONF"
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && exit 0
 
-    local MAX_RETRIES=3
-    local TIMEOUT_SEC=2
-    local SLEEP_BETWEEN=1
+    # Извлечение IP-адреса назначения из ядра (iptables)
+    local RULE=$(iptables-save | grep "$TUNNEL_ID" | grep "\-j DNAT" | head -n 1)
+    [[ -z "$RULE" ]] && exit 0 # Если правило не найдено, выходим тихо
+    
+    local DEST=$(echo "$RULE" | grep -oP '(?<=--to-destination )[\d\.:]+')
+    local TARGET_IP="${DEST%:*}"
+
+    # Вычисление среднего пинга по 3 пакетам (Average RTT)
+    local PING_OUT=$(ping -c 3 -q -W 2 "$TARGET_IP" 2>/dev/null)
+    local AVG_PING=9999 # По умолчанию узел недоступен
+    
+    if [[ $? -eq 0 ]]; then
+        # Извлечение числа из строки вида rtt min/avg/max/mdev = 10.1/10.5/11.0/0.1 ms
+        AVG_PING=$(echo "$PING_OUT" | awk -F'/' 'END{print $5}' | cut -d. -f1)
+        [[ -z "$AVG_PING" ]] && AVG_PING=9999
+    fi
+
+    local STATE_FILE="/tmp/gokaskad_wd_${TUNNEL_ID}.state"
 
     send_tg_alert() {
-        local message="$1"
+        local msg="$1"
         curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
-            -d text="${message}" \
+            -d text="${msg}" \
             -d parse_mode="HTML" > /dev/null
     }
 
-    check_tcp_port() {
-        local ip="$1"; local port="$2"
-        for ((i=1; i<=MAX_RETRIES; i++)); do
-            if timeout "$TIMEOUT_SEC" bash -c "</dev/tcp/$ip/$port" &>/dev/null; then return 0; fi
-            sleep "$SLEEP_BETWEEN"
-        done
-        return 1
-    }
-
-    check_icmp_ping() {
-        local ip="$1"
-        for ((i=1; i<=MAX_RETRIES; i++)); do
-            if ping -c 1 -W "$TIMEOUT_SEC" "$ip" &>/dev/null; then return 0; fi
-            sleep "$SLEEP_BETWEEN"
-        done
-        return 1
-    }
-
-    # Инвентаризация активных туннелей
-    local TUNNELS=$(iptables-save | grep "gokaskad_" | grep "\-j DNAT")
-    [[ -z "$TUNNELS" ]] && exit 0
-
-    echo "$TUNNELS" | while read -r line; do
-        local TUNNEL_ID=$(echo "$line" | grep -oP 'gokaskad_\w+')
-        local PROTO=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        local DEST=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        local TARGET_IP="${DEST%:*}"
-        local TARGET_PORT="${DEST#*:}"
-
-        [[ -z "$TUNNEL_ID" || -z "$TARGET_IP" ]] && continue
-
-        local IS_ALIVE=0
-        if [[ "$PROTO" == "tcp" ]]; then
-            check_tcp_port "$TARGET_IP" "$TARGET_PORT" && IS_ALIVE=1
-        elif [[ "$PROTO" == "udp" ]]; then
-            check_icmp_ping "$TARGET_IP" && IS_ALIVE=1
-        fi
-
-        # Логика деструкции при сбое
-        if [[ $IS_ALIVE -eq 0 ]]; then
-            iptables-save | grep -v "$TUNNEL_ID" | iptables-restore
-            netfilter-persistent save > /dev/null
-
-            local ALERT_MSG="🚨 <b>ОТКАЗ МАРШРУТИЗАЦИИ</b>%0A"
+    # Логика машины состояний
+    if (( AVG_PING > THRESHOLD )); then
+        # Если порог превышен, и файла состояния еще нет -> отправляем алерт
+        if [[ ! -f "$STATE_FILE" ]]; then
+            touch "$STATE_FILE"
+            local ALERT_MSG="⚠️ <b>ДЕГРАДАЦИЯ СЕТИ</b>%0A"
             ALERT_MSG+="Туннель: <code>$TUNNEL_ID</code>%0A"
-            ALERT_MSG+="Цель: <code>$TARGET_IP:$TARGET_PORT ($PROTO)</code>%0A"
-            ALERT_MSG+="Действие: Туннель автоматически демонтирован."
+            ALERT_MSG+="Сервер: <code>$TARGET_IP</code>%0A"
+            if (( AVG_PING == 9999 )); then
+                ALERT_MSG+="Статус: <b>Узел недоступен (100% loss)</b>"
+            else
+                ALERT_MSG+="Текущий пинг: <b>${AVG_PING} мс</b> (Порог: ${THRESHOLD} мс)"
+            fi
             send_tg_alert "$ALERT_MSG"
         fi
-    done
+    else
+        # Если пинг в норме, но файл состояния существует -> отправляем уведомление о восстановлении
+        if [[ -f "$STATE_FILE" ]]; then
+            rm -f "$STATE_FILE"
+            local REC_MSG="✅ <b>СЕТЬ ВОССТАНОВЛЕНА</b>%0A"
+            REC_MSG+="Туннель: <code>$TUNNEL_ID</code>%0A"
+            REC_MSG+="Текущий пинг: <b>${AVG_PING} мс</b>"
+            send_tg_alert "$REC_MSG"
+        fi
+    fi
 }
 
-# --- НАСТРОЙКА WATCHDOG (ИНТЕРАКТИВ) ---
+# --- ИНТЕРАКТИВНАЯ НАСТРОЙКА WATCHDOG ---
 configure_watchdog() {
-    echo -e "\n${CYAN}--- Настройка Telegram Мониторинга (Watchdog) ---${NC}"
-    echo -e "Система будет проверять туннели каждые 3 минуты."
-    echo -e "При недоступности зарубежного узла, каскад будет удален, а вы получите уведомление."
-    echo ""
+    echo -e "\n${CYAN}--- Настройка Телеметрии (Watchdog) ---${NC}"
+
+    # 1. Авторизация в Telegram
+    if [[ ! -f "$WATCHDOG_CONF" ]] || ! grep -q "TG_BOT_TOKEN" "$WATCHDOG_CONF"; then
+        read -p "Введите Telegram Bot Token: " tg_token
+        [[ -z "$tg_token" ]] && return
+        
+        read -p "Введите ваш Telegram Chat ID: " tg_chat_id
+        [[ -z "$tg_chat_id" ]] && return
+        
+        echo "TG_BOT_TOKEN=\"$tg_token\"" > "$WATCHDOG_CONF"
+        echo "TG_CHAT_ID=\"$tg_chat_id\"" >> "$WATCHDOG_CONF"
+        chmod 600 "$WATCHDOG_CONF" # Изоляция доступа
+    else
+        echo -e "${YELLOW}[INFO] Резервирование Telegram API: Учетные данные уже в системе.${NC}"
+    fi
+
+    # 2. Выбор целевого туннеля
+    echo -e "\nВыберите туннель для мониторинга:"
+    declare -a RULES_LIST
+    local i=1
     
-    read -p "Введите Telegram Bot Token (или Enter для отмены): " tg_token
-    [[ -z "$tg_token" ]] && return
+    while read -r line; do
+        local l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
+        local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+        if [[ -n "$l_id" ]]; then
+            RULES_LIST[$i]="$l_id"
+            echo -e "${YELLOW}[$i]${NC} Туннель: $l_id -> Цель: $l_dest"
+            ((i++))
+        fi
+    done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
 
-    read -p "Введите ваш Telegram Chat ID: " tg_chat_id
-    [[ -z "$tg_chat_id" ]] && return
+    if [ ${#RULES_LIST[@]} -eq 0 ]; then
+        echo -e "${RED}[INFO] Активные туннели для мониторинга не найдены.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
 
-    # Сохранение конфигурации
-    echo "TG_BOT_TOKEN=\"$tg_token\"" > "$WATCHDOG_CONF"
-    echo "TG_CHAT_ID=\"$tg_chat_id\"" >> "$WATCHDOG_CONF"
-    chmod 600 "$WATCHDOG_CONF" # Изоляция прав доступа к токену
+    read -p "Введите индекс туннеля (0 - отмена): " rule_num
+    if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
+    local target_id="${RULES_LIST[$rule_num]}"
 
-    # Регистрация в cron
-    (crontab -l 2>/dev/null | grep -v "gokaskad watchdog"; echo "*/3 * * * * /usr/local/bin/gokaskad watchdog") | crontab -
+    # 3. Ввод пороговых метрик
+    read -p "Допустимый порог пинга в миллисекундах (например, 150): " ping_thresh
+    if ! [[ "$ping_thresh" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; return; fi
+
+    read -p "Период измерения в минутах (например, 2): " check_period
+    if ! [[ "$check_period" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; return; fi
+
+    # 4. Внедрение задачи в планировщик ядра
+    local CRON_CMD="/usr/local/bin/gokaskad watchdog \"$target_id\" \"$ping_thresh\""
     
-    echo -e "${GREEN}[SUCCESS] Мониторинг активирован и добавлен в автозагрузку.${NC}"
-    read -p "Нажмите Enter..."
+    # Очистка старой задачи для этого туннеля (если была) и запись новой
+    (crontab -l 2>/dev/null | grep -v "$target_id"; echo "*/$check_period * * * * $CRON_CMD") | crontab -
+    
+    echo -e "${GREEN}[SUCCESS] Телеметрия активирована.${NC}"
+    echo -e "Туннель: $target_id | Порог: ${ping_thresh}мс | Интервал: каждые $check_period мин."
+    read -p "Нажмите Enter для продолжения..."
 }
 
 # --- МАРШРУТИЗАЦИЯ И ПРАВИЛА ---
@@ -280,20 +308,30 @@ delete_single_rule() {
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
 
     local target_id="${RULES_LIST[$rule_num]}"
+    
+    # 1. Удаление туннеля из iptables
     iptables-save | grep -v "$target_id" | iptables-restore
     netfilter-persistent save > /dev/null
 
-    echo -e "${GREEN}[OK] Туннель $target_id успешно демаршрутизирован.${NC}"
+    # 2. Очистка связанных задач мониторинга в планировщике
+    crontab -l 2>/dev/null | grep -v "$target_id" | crontab -
+    rm -f "/tmp/gokaskad_wd_${target_id}.state"
+
+    echo -e "${GREEN}[OK] Туннель $target_id и его задачи мониторинга демаршрутизированы.${NC}"
     read -p "Нажмите Enter..."
 }
 
 flush_rules_safe() {
     echo -e "\n${RED}!!! ВНИМАНИЕ: СИСТЕМНЫЙ СБРОС !!!${NC}"
-    read -p "Будут удалены ВСЕ правила маршрутизации. Подтвердить? (y/n): " confirm
+    read -p "Будут удалены ВСЕ правила маршрутизации и задачи мониторинга. Подтвердить? (y/n): " confirm
     if [[ "$confirm" == "y" ]]; then
+        # Очистка iptables
         iptables-save | grep -v "gokaskad_" | iptables-restore
         netfilter-persistent save > /dev/null
-        echo -e "${GREEN}[SUCCESS] Очистка завершена.${NC}"
+        # Очистка cron и стейтов
+        crontab -l 2>/dev/null | grep -v "gokaskad watchdog" | crontab -
+        rm -f /tmp/gokaskad_wd_*.state
+        echo -e "${GREEN}[SUCCESS] Очистка инфраструктуры завершена.${NC}"
     fi
     read -p "Нажмите Enter..."
 }
@@ -311,7 +349,7 @@ show_menu() {
         echo -e "4) Посмотреть активные правила"
         echo -e "5) ${RED}Удалить одно правило${NC}"
         echo -e "6) ${RED}Сбросить ВСЕ настройки${NC} (Безопасная очистка)"
-        echo -e "7) 🛡 Настроить ${YELLOW}Telegram-мониторинг${NC} (Watchdog)"
+        echo -e "7) 🛡 Настроить ${YELLOW}Телеметрию туннеля${NC} (Ping Watchdog)"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -331,13 +369,13 @@ show_menu() {
 }
 
 # --- МАРШРУТИЗАЦИЯ КОНТЕКСТА ИСПОЛНЕНИЯ ---
-# Если скрипт запущен фоном через cron с аргументом "watchdog"
+# Фоновый запуск (Телеметрия)
 if [[ "$1" == "watchdog" ]]; then
-    run_watchdog
+    run_watchdog "$2" "$3"
     exit 0
 fi
 
-# Иначе - запуск интерактивного режима
+# Интерактивный запуск (Конфигуратор)
 check_root
 prepare_system
 show_menu

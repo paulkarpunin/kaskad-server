@@ -219,7 +219,7 @@ list_active_rules() {
         local l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         local l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        local l_id=$(echo "$line" | grep -oP '(?<=--comment )"gokaskad_[^"]+"' | tr -d '"')
+        local l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
 
         if [[ -n "$l_id" ]]; then
             printf "%-20s\t%-6s\t%-8s\t%s\n" "$l_id" "$l_port" "$l_proto" "$l_dest"
@@ -238,7 +238,7 @@ delete_single_rule() {
         local l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         local l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        local l_id=$(echo "$line" | grep -oP '(?<=--comment )"gokaskad_[^"]+"' | tr -d '"')
+        local l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
 
         if [[ -n "$l_id" ]]; then
             RULES_LIST[$i]="$l_id"

@@ -89,7 +89,6 @@ run_watchdog() {
     
     source "$WATCHDOG_CONF"
     
-    # Глобальный рубильник: если служба ТГ выключена, выходим
     [[ "$TG_ALERTS_ENABLED" == "0" ]] && exit 0
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && exit 0
 
@@ -161,7 +160,7 @@ manage_tg_bot() {
         
         local chat_id="${TG_CHAT_ID:-[Не задан]}"
         
-        local status="${TG_ALERTS_ENABLED:-1}" # По умолчанию включено
+        local status="${TG_ALERTS_ENABLED:-1}"
         local status_text="${GREEN}ВКЛЮЧЕНА${NC} (Алерты отправляются)"
         [[ "$status" == "0" ]] && status_text="${RED}ОСТАНОВЛЕНА${NC} (Алерты на паузе)"
 
@@ -175,6 +174,7 @@ manage_tg_bot() {
         else
             echo -e "2) ${GREEN}Включить${NC} службу отправки уведомлений"
         fi
+        echo -e "3) ✉️  Отправить тестовое сообщение"
         echo -e "0) Назад"
         
         read -p "Ваш выбор: " choice
@@ -184,13 +184,12 @@ manage_tg_bot() {
                 read -p "Введите новый Telegram Bot Token: " new_token
                 read -p "Введите новый Telegram Chat ID: " new_chat_id
                 if [[ -n "$new_token" && -n "$new_chat_id" ]]; then
-                    # Очистка старых значений
                     [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_BOT_TOKEN/d' "$WATCHDOG_CONF"
                     [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_CHAT_ID/d' "$WATCHDOG_CONF"
                     
                     echo "TG_BOT_TOKEN=\"$new_token\"" >> "$WATCHDOG_CONF"
                     echo "TG_CHAT_ID=\"$new_chat_id\"" >> "$WATCHDOG_CONF"
-                    # Если статуса нет, задаем его включенным по умолчанию
+                    
                     if ! grep -q "TG_ALERTS_ENABLED" "$WATCHDOG_CONF" 2>/dev/null; then
                         echo "TG_ALERTS_ENABLED=\"1\"" >> "$WATCHDOG_CONF"
                     fi
@@ -205,6 +204,33 @@ manage_tg_bot() {
                 
                 [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_ALERTS_ENABLED/d' "$WATCHDOG_CONF"
                 echo "TG_ALERTS_ENABLED=\"$new_status\"" >> "$WATCHDOG_CONF"
+                ;;
+            3)
+                if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+                    echo -e "\n${RED}[ОШИБКА] Токен или Chat ID не заданы. Сначала выполните пункт 1.${NC}"
+                else
+                    echo -e "\n${YELLOW}[*] Отправка тестового запроса к API Telegram...${NC}"
+                    local test_msg="✅ <b>Тестовое сообщение</b>%0AИнтеграция с маршрутизатором gokaskad настроена корректно!"
+                    
+                    # Отправка запроса с захватом HTTP кода ответа
+                    local response=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                        -d chat_id="${TG_CHAT_ID}" \
+                        -d text="${test_msg}" \
+                        -d parse_mode="HTML")
+                    
+                    # Извлечение последней строки (HTTP код)
+                    local http_code=$(echo "$response" | tail -n1)
+                    
+                    if [[ "$http_code" == "200" ]]; then
+                        echo -e "${GREEN}[SUCCESS] Сообщение успешно доставлено в ваш Telegram!${NC}"
+                    else
+                        echo -e "${RED}[ERROR] Сбой интеграции. Код ответа сервера Telegram: $http_code${NC}"
+                        echo -e "${CYAN}Убедитесь, что:${NC}"
+                        echo -e "1. Вы скопировали Токен и Chat ID без лишних пробелов."
+                        echo -e "2. Вы нажали кнопку /start в диалоге с вашим ботом."
+                    fi
+                fi
+                read -p "Нажмите Enter для возврата..."
                 ;;
             0) return ;;
         esac

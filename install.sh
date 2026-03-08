@@ -12,105 +12,79 @@ NC='\033[0m'
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-type_text() {
-    local text="$1"
-    local delay=0.03
-    for (( i=0; i<${#text}; i++ )); do
-        echo -n "${text:$i:1}"
-        sleep $delay
-    done
-    echo ""
-}
-
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}[ERROR] Запустите скрипт с правами root!${NC}"
+        echo -e "${RED}[ERROR] Критический сбой: Требуются права суперпользователя (root).${NC}"
         exit 1
     fi
 }
 
-# --- ПОДГОТОВКА СИСТЕМЫ ---
+# Строгая математическая валидация IPv4
+validate_ipv4() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for octet in "${BASH_REMATCH[@]:1:4}"; do
+            if (( 10#$octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    else
+        return 1
+    fi
+}
+
+# --- ПОДГОТОВКА СИСТЕМЫ (ИЗОЛИРОВАННАЯ ИНИЦИАЛИЗАЦИЯ) ---
 prepare_system() {
-    # Автоматическое создание глобальной команды gokaskad
+    # 1. Интеграция бинарного файла
+# 1. Интеграция бинарного файла (с защитой от потокового сбоя)
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
-        cp -f "$0" "/usr/local/bin/gokaskad"
+        # Если скрипт запущен через конвейер curl/bash (имя процесса содержит bash или fd)
+        if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]]; then
+            curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "/usr/local/bin/gokaskad"
+        else
+            cp -f "$0" "/usr/local/bin/gokaskad"
+        fi
         chmod +x "/usr/local/bin/gokaskad"
     fi
 
-    # Включение IP Forwarding
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    else
-        sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    fi
+    # 2. Изолированная настройка ядра (Sysctl)
+    local SYSCTL_FILE="/etc/sysctl.d/99-gokaskad.conf"
+    cat <<EOF > "$SYSCTL_FILE"
+# Конфигурация сгенерирована gokaskad (Управление задержками и маршрутизацией)
+net.ipv4.ip_forward=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl --system > /dev/null 2>&1
 
-    # Активация Google BBR
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-    sysctl -p > /dev/null
-
-    # Установка зависимостей
+    # 3. Интеллектуальное разрешение зависимостей
     export DEBIAN_FRONTEND=noninteractive
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
-        apt-get update -y > /dev/null
-        apt-get install -y iptables-persistent netfilter-persistent qrencode > /dev/null
-    fi
-}
+    local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "qrencode")
+    local MISSING_PKGS=""
 
-# --- ПРОМО БЛОК ---
-show_promo() {
-    clear
-    echo ""
-    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║         ХОСТИНГ, КОТОРЫЙ РАБОТАЕТ СО СКИДКОЙ ДО -60%         ║${NC}"
-    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-
-    echo -e "${CYAN}🌍 ЛОКАЦИИ: РФ И ЕВРОПА${NC}"
-    echo -e "${WHITE}  >>> https://vk.cc/ct29NQ${NC}"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "OFF60" "60% скидка на первый месяц"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka20" "Буст 20% + 3% (при оплате за 3 мес)"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka6" "Буст 15% + 5% (при оплате за 6 мес)"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka12" "Буст 5% + 5% (при оплате за 12 мес)"
-
-    echo -e "\n${CYAN}🇧🇾 ЛОКАЦИЯ: БЕЛАРУСЬ${NC}"
-    echo -e "${WHITE}  >>> https://vk.cc/cUxAhj${NC}"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "OFF60" "60% скидка на первый месяц"
-
-    echo ""
-    echo -e "\n${YELLOW}Генерация QR-кода основного партнера... (3 сек)${NC}"
-    for i in {3..1}; do
-        echo -ne "$i..."
-        sleep 1
+    for pkg in "${REQUIRED_PKGS[@]}"; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            MISSING_PKGS="$MISSING_PKGS $pkg"
+        fi
     done
-    echo ""
 
-    echo -e "\n${WHITE}" 
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "https://vk.cc/ct29NQ"
-    else
-        echo "QR-код не загрузился, используйте ссылки выше."
+    if [[ -n "$MISSING_PKGS" ]]; then
+        echo -e "${YELLOW}[*] Инсталляция системных зависимостей:$MISSING_PKGS${NC}"
+        apt-get update -y > /dev/null
+        apt-get install -y $MISSING_PKGS > /dev/null
     fi
-    echo -e "${NC}"
-    
-    echo -e "${GREEN}Сканируйте камерой телефона!${NC}"
-    echo ""
-    read -p "Нажмите enter для настройки каскадного скрипта..."
 }
 
-# --- ИНСТРУКЦИЯ (ТЕКСТ ВНУТРИ КОДА) ---
+# --- ИНСТРУКЦИИ ---
 show_instructions() {
     clear
-    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║             📚 ИНСТРУКЦИЯ: КАК НАСТРОИТЬ КАСКАД              ║${NC}"
-    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${MAGENTA}╔════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${MAGENTA}║          КАК НАСТРОИТЬ КАСКАДНОЕ СОЕДИНЕНИЕ            ║${NC}"
+    echo -e "${MAGENTA}╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${CYAN}ШАГ 1: Подготовка${NC}"
-    echo -e "У вас должны быть данные от зарубежного сервера (VPN/Прокси и т.д.):"
+    echo -e "У вас должны быть данные от зарубежного сервера:"
     echo -e " - ${YELLOW}IP адрес${NC} (зарубежный)"
     echo -e " - ${YELLOW}Порт${NC} (на котором работает целевой сервис)"
     echo ""
@@ -125,12 +99,10 @@ show_instructions() {
     echo -e "3. Замените зарубежный IP на ${GREEN}IP ЭТОГО СЕРВЕРА${NC}."
     echo -e "4. Если вы использовали разные порты в правиле №4, укажите Входящий порт."
     echo ""
-    echo -e "${GREEN}Готово! Теперь трафик идет: Клиент -> Этот Сервер -> Зарубеж.${NC}"
-    echo ""
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
-# --- СТАНДАРТНАЯ НАСТРОЙКА (ПОРТ ВХОДА = ПОРТ ВЫХОДА) ---
+# --- КОНФИГУРАЦИЯ ПРАВИЛ ВВОДА ---
 configure_rule() {
     local PROTO=$1
     local NAME=$2
@@ -138,28 +110,26 @@ configure_rule() {
     echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) ---${NC}"
 
     while true; do
-        echo -e "Введите IP адрес назначения:"
+        echo -e "Введите IP адрес назначения (зарубежный сервер):"
         read -p "> " TARGET_IP
-        if [[ -n "$TARGET_IP" ]]; then break; fi
+        if validate_ipv4 "$TARGET_IP"; then break; fi
+        echo -e "${RED}[ERROR] Критическая ошибка: Некорректный формат IPv4-адреса.${NC}"
+        echo -e "${YELLOW}Пример правильного ввода: 192.168.1.100${NC}"
     done
 
     while true; do
         echo -e "Введите Порт (одинаковый для входа и выхода):"
         read -p "> " PORT
         if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом!${NC}"
+        echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
     done
 
     apply_iptables_rules "$PROTO" "$PORT" "$PORT" "$TARGET_IP" "$NAME"
 }
 
-# --- КАСТОМНАЯ НАСТРОЙКА (РАЗНЫЕ ПОРТЫ) ---
 configure_custom_rule() {
     echo -e "\n${CYAN}--- 🛠 Универсальное кастомное правило ---${NC}"
-    echo -e "${WHITE}Подходит для перенаправления ЛЮБЫХ протоколов (SSH, RDP, нестандартные порты)."
-    echo -e "Позволяет сделать так, чтобы клиент подключался к одному порту,"
-    echo -e "а трафик уходил на другой порт зарубежного сервера.${NC}\n"
-
+    
     while true; do
         echo -e "Выберите протокол (${YELLOW}tcp${NC} или ${YELLOW}udp${NC}):"
         read -p "> " PROTO
@@ -170,7 +140,8 @@ configure_custom_rule() {
     while true; do
         echo -e "Введите IP адрес назначения (куда отправляем трафик):"
         read -p "> " TARGET_IP
-        if [[ -n "$TARGET_IP" ]]; then break; fi
+        if validate_ipv4 "$TARGET_IP"; then break; fi
+        echo -e "${RED}[ERROR] Критическая ошибка: Некорректный формат IPv4-адреса.${NC}"
     done
 
     while true; do
@@ -190,7 +161,7 @@ configure_custom_rule() {
     apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "Custom Rule"
 }
 
-# --- ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES ---
+# --- ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES С МЕТАДАННЫМИ ---
 apply_iptables_rules() {
     local PROTO=$1
     local IN_PORT=$2
@@ -198,156 +169,141 @@ apply_iptables_rules() {
     local TARGET_IP=$4
     local NAME=$5
 
+    local CASCADE_ID="gokaskad_${PROTO}_${IN_PORT}"
     IFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+    
     if [[ -z "$IFACE" ]]; then
-        echo -e "${RED}[ERROR] Не удалось определить интерфейс!${NC}"
+        echo -e "${RED}[ERROR] Системный сбой: Не удалось определить внешний интерфейс маршрутизации!${NC}"
         exit 1
     fi
 
-    echo -e "${YELLOW}[*] Применение правил...${NC}"
+    echo -e "${YELLOW}[*] Компиляция и внедрение маркированных правил...${NC}"
 
-    # Удаление старых правил (по входящему порту)
+    # Очистка предыдущего состояния (Идемпотентность)
     iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
     iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
 
-    # Новые правила
-    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
-    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
+    # Инъекция новых правил со строгими метаданными (-m comment)
+    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$CASCADE_ID" -j ACCEPT
+    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$CASCADE_ID" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
     
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+        iptables -t nat -A POSTROUTING -o "$IFACE" -m comment --comment "gokaskad_global_nat" -j MASQUERADE
     fi
 
-    iptables -A FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -m comment --comment "$CASCADE_ID" -j ACCEPT
+    iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -m comment --comment "$CASCADE_ID" -j ACCEPT
 
-    # Настройка UFW если активен
+    # Интеграция с высокоуровневым фаерволом (UFW) - Точечная маршрутизация
     if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
         ufw allow "$IN_PORT"/"$PROTO" >/dev/null
-        sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+        ufw route allow in on "$IFACE" out on "$IFACE" to "$TARGET_IP" port "$OUT_PORT" proto "$PROTO" >/dev/null
         ufw reload >/dev/null
     fi
 
     netfilter-persistent save > /dev/null
     
-    echo -e "${GREEN}[SUCCESS] $NAME настроен!${NC}"
-    echo -e "$PROTO: Вход $IN_PORT -> Выход $TARGET_IP:$OUT_PORT"
-    read -p "Нажмите Enter для возврата в меню..."
+    echo -e "${GREEN}[SUCCESS] Логический узел '$NAME' успешно маршрутизирован.${NC}"
+    echo -e "${CYAN}Идентификатор туннеля:${NC} $CASCADE_ID"
+    read -p "Нажмите Enter для возврата в системное меню..."
 }
 
-# --- СПИСОК ПРАВИЛ ---
+# --- ИНВЕНТАРИЗАЦИЯ И УДАЛЕНИЕ (АТОМАРНЫЕ ОПЕРАЦИИ) ---
 list_active_rules() {
-    echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
-    echo -e "${MAGENTA}ПОРТ (ВХОД)\tПРОТОКОЛ\tЦЕЛЬ (IP:ВЫХОД)${NC}"
-    iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
+    echo -e "\n${CYAN}--- Активные переадресации (Туннели) ---${NC}"
+    echo -e "${MAGENTA}ID ТУННЕЛЯ\t\tВХОД\tПРОТОКОЛ\tЦЕЛЬ (IP:ВЫХОД)${NC}"
+
+    iptables -t nat -S PREROUTING | grep "gokaskad_" | while read -r line; do
+        local l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
+        local l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
+        local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+        local l_id=$(echo "$line" | grep -oP '(?<=--comment )"gokaskad_[^"]+"' | tr -d '"')
+
+        if [[ -n "$l_id" ]]; then
+            printf "%-20s\t%-6s\t%-8s\t%s\n" "$l_id" "$l_port" "$l_proto" "$l_dest"
+        fi
     done
     echo ""
-    
-    echo -e "${GREEN}💰 Задонатить каналу и автору:${NC}"
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "https://pay.cloudtips.ru/p/7410814f"
-    else
-        echo "https://pay.cloudtips.ru/p/7410814f"
-    fi
-    echo ""
-
-    read -p "Нажмите Enter..."
+    read -p "Нажмите Enter для продолжения..."
 }
 
-# --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
 delete_single_rule() {
-    echo -e "\n${CYAN}--- Удаление правила ---${NC}"
+    echo -e "\n${CYAN}--- Деструкция логического туннеля ---${NC}"
     declare -a RULES_LIST
     local i=1
+
     while read -r line; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then
-            RULES_LIST[$i]="$l_port:$l_proto:$l_dest"
-            echo -e "${YELLOW}[$i]${NC} Вход: $l_port ($l_proto) -> Выход: $l_dest"
+        local l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
+        local l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
+        local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+        local l_id=$(echo "$line" | grep -oP '(?<=--comment )"gokaskad_[^"]+"' | tr -d '"')
+
+        if [[ -n "$l_id" ]]; then
+            RULES_LIST[$i]="$l_id"
+            echo -e "${YELLOW}[$i]${NC} Туннель: $l_id | Вход: $l_port ($l_proto) -> $l_dest"
             ((i++))
         fi
-    done < <(iptables -t nat -S PREROUTING | grep "DNAT")
+    done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
 
     if [ ${#RULES_LIST[@]} -eq 0 ]; then
-        echo -e "${RED}Нет активных правил.${NC}"
+        echo -e "${RED}[INFO] Активные туннели не обнаружены.${NC}"
         read -p "Нажмите Enter..."
         return
     fi
 
     echo ""
-    read -p "Номер правила для удаления (0 отмена): " rule_num
+    read -p "Введите индекс туннеля для удаления (0 - отмена): " rule_num
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
 
-    # Разбираем строку
-    IFS=':' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
-    local target_ip="${d_dest%:*}"
-    local target_port="${d_dest#*:}"
+    local target_id="${RULES_LIST[$rule_num]}"
     
-    iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
-    iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    
+    # Атомарное удаление
+    iptables-save | grep -v "$target_id" | iptables-restore
     netfilter-persistent save > /dev/null
-    echo -e "${GREEN}[OK] Правило удалено.${NC}"
+
+    echo -e "${GREEN}[OK] Туннель $target_id успешно демаршрутизирован.${NC}"
     read -p "Нажмите Enter..."
 }
 
-# --- ПОЛНАЯ ОЧИСТКА ---
-flush_rules() {
-    echo -e "\n${RED}!!! ВНИМАНИЕ !!!${NC}"
-    echo "Сброс ВСЕХ настроек iptables."
-    read -p "Вы уверены? (y/n): " confirm
+flush_rules_safe() {
+    echo -e "\n${RED}!!! ВНИМАНИЕ: СИСТЕМНЫЙ СБРОС !!!${NC}"
+    echo "Будут удалены ВСЕ правила маршрутизации, созданные данным скриптом."
+    read -p "Подтвердить операцию? (y/n): " confirm
+    
     if [[ "$confirm" == "y" ]]; then
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -t nat -F
-        iptables -t mangle -F
-        iptables -F
-        iptables -X
-        netfilter-persistent save > /dev/null
-        echo -e "${GREEN}[OK] Очищено.${NC}"
+        local rule_count=$(iptables-save | grep -c "gokaskad_")
+
+        if [[ "$rule_count" -eq 0 ]]; then
+            echo -e "${GREEN}[OK] Система чиста. Инфраструктура каскадов не найдена.${NC}"
+        else
+            iptables-save | grep -v "gokaskad_" | iptables-restore
+            netfilter-persistent save > /dev/null
+            echo -e "${GREEN}[SUCCESS] Очистка завершена.${NC}"
+        fi
     fi
-    read -p "Нажмите Enter..."
+    read -p "Нажмите Enter для возврата в системное меню..."
 }
 
-# --- МЕНЮ ---
+# --- ГЛАВНОЕ МЕНЮ ---
 show_menu() {
     while true; do
         clear
         echo -e "${MAGENTA}"
-        echo "******************************************************"
-        echo "       anten-ka канал представляет..."
-        echo "       YouTube: https://www.youtube.com/@antenkaru"
-        echo "******************************************************"
+        echo "***************************************************************"
+        echo "       server-kaskad - Интеллектуальный NAT-маршрутизатор"
+        echo "***************************************************************"
         echo -e "${NC}"
-        
-        echo -e "${YELLOW}Получить инструкции:${NC}"
-        echo -e "1 способ: ${BLUE}https://boosty.to/anten-ka${NC}"
-        echo -e "2 способ: ${BLUE}https://antenka.taplink.ws${NC}"
-        echo -e "3 способ: ${BLUE}https://web.tribute.tg/p/cJu${NC}"
-        echo ""
-        echo -e "${GREEN}💰 Задонатить каналу и автору:${NC} https://pay.cloudtips.ru/p/7410814f"
-        echo -e "------------------------------------------------------"
         
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
         echo -e "3) Настроить ${CYAN}TProxy / MTProto${NC} (TCP)"
-        echo -e "4) 🛠 Создать ${YELLOW}Кастомное правило${NC} (Разные порты, SSH, RDP...)"
+        echo -e "4) Создать ${CYAN}Кастомное правило${NC} (Разные порты, SSH, RDP...)"
         echo -e "5) Посмотреть активные правила"
         echo -e "6) ${RED}Удалить одно правило${NC}"
-        echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
-        echo -e "8) ${YELLOW}Показать PROMO${NC}"
-        echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "7) ${RED}Сбросить ВСЕ настройки${NC} (Безопасная очистка)"
+        echo -e "8) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -359,9 +315,8 @@ show_menu() {
             4) configure_custom_rule ;;
             5) list_active_rules ;;
             6) delete_single_rule ;;
-            7) flush_rules ;;
-            8) show_promo ;;
-            9) show_instructions ;;
+            7) flush_rules_safe ;;
+            8) show_instructions ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -371,5 +326,4 @@ show_menu() {
 # --- ЗАПУСК ---
 check_root
 prepare_system
-show_promo
 show_menu

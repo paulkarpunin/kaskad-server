@@ -33,6 +33,12 @@ validate_ipv4() {
     fi
 }
 
+load_tg_config() {
+    if [[ -f "$WATCHDOG_CONF" ]]; then
+        source "$WATCHDOG_CONF"
+    fi
+}
+
 # --- ПОДГОТОВКА СИСТЕМЫ ---
 prepare_system() {
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
@@ -82,21 +88,21 @@ run_watchdog() {
     [[ ! -f "$WATCHDOG_CONF" ]] && exit 0
     
     source "$WATCHDOG_CONF"
+    
+    # Глобальный рубильник: если служба ТГ выключена, выходим
+    [[ "$TG_ALERTS_ENABLED" == "0" ]] && exit 0
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && exit 0
 
-    # Извлечение IP-адреса назначения из ядра (iptables)
     local RULE=$(iptables-save | grep "$TUNNEL_ID" | grep "\-j DNAT" | head -n 1)
-    [[ -z "$RULE" ]] && exit 0 # Если правило не найдено, выходим тихо
+    [[ -z "$RULE" ]] && exit 0 
     
     local DEST=$(echo "$RULE" | grep -oP '(?<=--to-destination )[\d\.:]+')
     local TARGET_IP="${DEST%:*}"
 
-    # Вычисление среднего пинга по 3 пакетам (Average RTT)
     local PING_OUT=$(ping -c 3 -q -W 2 "$TARGET_IP" 2>/dev/null)
-    local AVG_PING=9999 # По умолчанию узел недоступен
+    local AVG_PING=9999
     
     if [[ $? -eq 0 ]]; then
-        # Извлечение числа из строки вида rtt min/avg/max/mdev = 10.1/10.5/11.0/0.1 ms
         AVG_PING=$(echo "$PING_OUT" | awk -F'/' 'END{print $5}' | cut -d. -f1)
         [[ -z "$AVG_PING" ]] && AVG_PING=9999
     fi
@@ -111,9 +117,7 @@ run_watchdog() {
             -d parse_mode="HTML" > /dev/null
     }
 
-    # Логика машины состояний
     if (( AVG_PING > THRESHOLD )); then
-        # Если порог превышен, и файла состояния еще нет -> отправляем алерт
         if [[ ! -f "$STATE_FILE" ]]; then
             touch "$STATE_FILE"
             local ALERT_MSG="⚠️ <b>ДЕГРАДАЦИЯ СЕТИ</b>%0A"
@@ -127,7 +131,6 @@ run_watchdog() {
             send_tg_alert "$ALERT_MSG"
         fi
     else
-        # Если пинг в норме, но файл состояния существует -> отправляем уведомление о восстановлении
         if [[ -f "$STATE_FILE" ]]; then
             rm -f "$STATE_FILE"
             local REC_MSG="✅ <b>СЕТЬ ВОССТАНОВЛЕНА</b>%0A"
@@ -138,27 +141,119 @@ run_watchdog() {
     fi
 }
 
-# --- ИНТЕРАКТИВНАЯ НАСТРОЙКА WATCHDOG ---
-configure_watchdog() {
-    echo -e "\n${CYAN}--- Настройка Телеметрии (Watchdog) ---${NC}"
+# --- УПРАВЛЕНИЕ TELEGRAM БОТОМ ---
+manage_tg_bot() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- 🤖 Настройки Telegram-бота ---${NC}"
+        
+        load_tg_config
+        
+        local masked_token="[Не задан]"
+        if [[ -n "$TG_BOT_TOKEN" ]]; then
+            local len=${#TG_BOT_TOKEN}
+            if (( len > 10 )); then
+                masked_token="${TG_BOT_TOKEN:0:5}***${TG_BOT_TOKEN: -4}"
+            else
+                masked_token="***"
+            fi
+        fi
+        
+        local chat_id="${TG_CHAT_ID:-[Не задан]}"
+        
+        local status="${TG_ALERTS_ENABLED:-1}" # По умолчанию включено
+        local status_text="${GREEN}ВКЛЮЧЕНА${NC} (Алерты отправляются)"
+        [[ "$status" == "0" ]] && status_text="${RED}ОСТАНОВЛЕНА${NC} (Алерты на паузе)"
 
-    # 1. Авторизация в Telegram
-    if [[ ! -f "$WATCHDOG_CONF" ]] || ! grep -q "TG_BOT_TOKEN" "$WATCHDOG_CONF"; then
-        read -p "Введите Telegram Bot Token: " tg_token
-        [[ -z "$tg_token" ]] && return
+        echo -e "Токен бота : ${CYAN}$masked_token${NC}"
+        echo -e "Chat ID    : ${CYAN}$chat_id${NC}"
+        echo -e "Служба ТГ  : $status_text\n"
+
+        echo -e "1) Изменить Token и Chat ID"
+        if [[ "$status" == "1" ]]; then
+            echo -e "2) ${RED}Выключить${NC} службу отправки уведомлений"
+        else
+            echo -e "2) ${GREEN}Включить${NC} службу отправки уведомлений"
+        fi
+        echo -e "0) Назад"
         
-        read -p "Введите ваш Telegram Chat ID: " tg_chat_id
-        [[ -z "$tg_chat_id" ]] && return
+        read -p "Ваш выбор: " choice
+        case $choice in
+            1)
+                echo ""
+                read -p "Введите новый Telegram Bot Token: " new_token
+                read -p "Введите новый Telegram Chat ID: " new_chat_id
+                if [[ -n "$new_token" && -n "$new_chat_id" ]]; then
+                    # Очистка старых значений
+                    [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_BOT_TOKEN/d' "$WATCHDOG_CONF"
+                    [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_CHAT_ID/d' "$WATCHDOG_CONF"
+                    
+                    echo "TG_BOT_TOKEN=\"$new_token\"" >> "$WATCHDOG_CONF"
+                    echo "TG_CHAT_ID=\"$new_chat_id\"" >> "$WATCHDOG_CONF"
+                    # Если статуса нет, задаем его включенным по умолчанию
+                    if ! grep -q "TG_ALERTS_ENABLED" "$WATCHDOG_CONF" 2>/dev/null; then
+                        echo "TG_ALERTS_ENABLED=\"1\"" >> "$WATCHDOG_CONF"
+                    fi
+                    chmod 600 "$WATCHDOG_CONF"
+                    echo -e "${GREEN}[OK] Данные бота успешно обновлены.${NC}"
+                    sleep 1
+                fi
+                ;;
+            2)
+                local new_status="1"
+                [[ "$status" == "1" ]] && new_status="0"
+                
+                [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_ALERTS_ENABLED/d' "$WATCHDOG_CONF"
+                echo "TG_ALERTS_ENABLED=\"$new_status\"" >> "$WATCHDOG_CONF"
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
+# --- УПРАВЛЕНИЕ МОНИТОРИНГОМ (WATCHDOG) ---
+manage_watchdog() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- 🛡 Управление телеметрией туннелей ---${NC}\n"
         
-        echo "TG_BOT_TOKEN=\"$tg_token\"" > "$WATCHDOG_CONF"
-        echo "TG_CHAT_ID=\"$tg_chat_id\"" >> "$WATCHDOG_CONF"
-        chmod 600 "$WATCHDOG_CONF" # Изоляция доступа
-    else
-        echo -e "${YELLOW}[INFO] Резервирование Telegram API: Учетные данные уже в системе.${NC}"
+        echo -e "${CYAN}Активные задачи мониторинга в планировщике:${NC}"
+        local cron_jobs=$(crontab -l 2>/dev/null | grep "/usr/local/bin/gokaskad watchdog")
+        
+        if [[ -z "$cron_jobs" ]]; then
+            echo -e "${YELLOW}Нет активных задач мониторинга.${NC}\n"
+        else
+            echo "$cron_jobs" | while read -r line; do
+                local period=$(echo "$line" | awk '{print $1}' | tr -d '*/')
+                local tid=$(echo "$line" | grep -oP 'gokaskad_\w+')
+                local thresh=$(echo "$line" | awk -F'"' '{print $4}')
+                echo -e "Туннель: ${WHITE}$tid${NC} | Порог: ${YELLOW}${thresh}мс${NC} | Интервал: каждые ${GREEN}${period}мин${NC}"
+            done
+            echo ""
+        fi
+
+        echo "1) Добавить туннель в мониторинг"
+        echo "2) Удалить туннель из мониторинга"
+        echo "0) Назад"
+
+        read -p "Ваш выбор: " choice
+        case $choice in
+            1) add_watchdog_rule ;;
+            2) remove_watchdog_rule ;;
+            0) return ;;
+        esac
+    done
+}
+
+add_watchdog_rule() {
+    load_tg_config
+    if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+        echo -e "\n${RED}[ВНИМАНИЕ] Сначала настройте Telegram-бота (Пункт 7 в главном меню)!${NC}"
+        read -p "Нажмите Enter..."
+        return
     fi
 
-    # 2. Выбор целевого туннеля
-    echo -e "\nВыберите туннель для мониторинга:"
+    echo -e "\n${CYAN}Выберите туннель для настройки телеметрии:${NC}"
     declare -a RULES_LIST
     local i=1
     
@@ -182,23 +277,48 @@ configure_watchdog() {
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
     local target_id="${RULES_LIST[$rule_num]}"
 
-    # 3. Ввод пороговых метрик
     read -p "Допустимый порог пинга в миллисекундах (например, 150): " ping_thresh
-    if ! [[ "$ping_thresh" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; return; fi
+    if ! [[ "$ping_thresh" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; read -p "Enter..."; return; fi
 
     read -p "Период измерения в минутах (например, 2): " check_period
-    if ! [[ "$check_period" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; return; fi
+    if ! [[ "$check_period" =~ ^[0-9]+$ ]]; then echo -e "${RED}Ошибка: Ожидается целое число.${NC}"; read -p "Enter..."; return; fi
 
-    # 4. Внедрение задачи в планировщик ядра
     local CRON_CMD="/usr/local/bin/gokaskad watchdog \"$target_id\" \"$ping_thresh\""
-    
-    # Очистка старой задачи для этого туннеля (если была) и запись новой
     (crontab -l 2>/dev/null | grep -v "$target_id"; echo "*/$check_period * * * * $CRON_CMD") | crontab -
     
-    echo -e "${GREEN}[SUCCESS] Телеметрия активирована.${NC}"
-    echo -e "Туннель: $target_id | Порог: ${ping_thresh}мс | Интервал: каждые $check_period мин."
-    read -p "Нажмите Enter для продолжения..."
+    echo -e "${GREEN}[SUCCESS] Туннель добавлен в мониторинг.${NC}"
+    read -p "Нажмите Enter..."
 }
+
+remove_watchdog_rule() {
+    echo -e "\n${CYAN}Удаление телеметрии:${NC}"
+    
+    declare -a MON_LIST
+    local i=1
+    while read -r line; do
+        local tid=$(echo "$line" | grep -oP 'gokaskad_\w+')
+        MON_LIST[$i]="$tid"
+        echo -e "${YELLOW}[$i]${NC} Туннель: $tid"
+        ((i++))
+    done < <(crontab -l 2>/dev/null | grep "/usr/local/bin/gokaskad watchdog")
+
+    if [ ${#MON_LIST[@]} -eq 0 ]; then
+        echo -e "${YELLOW}Нет активных задач для удаления.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    read -p "Введите индекс для удаления (0 - отмена): " del_num
+    if [[ "$del_num" == "0" || -z "${MON_LIST[$del_num]}" ]]; then return; fi
+    local target_id="${MON_LIST[$del_num]}"
+
+    crontab -l 2>/dev/null | grep -v "$target_id" | crontab -
+    rm -f "/tmp/gokaskad_wd_${target_id}.state"
+    
+    echo -e "${GREEN}[OK] Мониторинг для $target_id отключен.${NC}"
+    read -p "Нажмите Enter..."
+}
+
 
 # --- МАРШРУТИЗАЦИЯ И ПРАВИЛА ---
 configure_rule() {
@@ -309,11 +429,9 @@ delete_single_rule() {
 
     local target_id="${RULES_LIST[$rule_num]}"
     
-    # 1. Удаление туннеля из iptables
     iptables-save | grep -v "$target_id" | iptables-restore
     netfilter-persistent save > /dev/null
 
-    # 2. Очистка связанных задач мониторинга в планировщике
     crontab -l 2>/dev/null | grep -v "$target_id" | crontab -
     rm -f "/tmp/gokaskad_wd_${target_id}.state"
 
@@ -325,10 +443,8 @@ flush_rules_safe() {
     echo -e "\n${RED}!!! ВНИМАНИЕ: СИСТЕМНЫЙ СБРОС !!!${NC}"
     read -p "Будут удалены ВСЕ правила маршрутизации и задачи мониторинга. Подтвердить? (y/n): " confirm
     if [[ "$confirm" == "y" ]]; then
-        # Очистка iptables
         iptables-save | grep -v "gokaskad_" | iptables-restore
         netfilter-persistent save > /dev/null
-        # Очистка cron и стейтов
         crontab -l 2>/dev/null | grep -v "gokaskad watchdog" | crontab -
         rm -f /tmp/gokaskad_wd_*.state
         echo -e "${GREEN}[SUCCESS] Очистка инфраструктуры завершена.${NC}"
@@ -349,7 +465,8 @@ show_menu() {
         echo -e "4) Посмотреть активные правила"
         echo -e "5) ${RED}Удалить одно правило${NC}"
         echo -e "6) ${RED}Сбросить ВСЕ настройки${NC} (Безопасная очистка)"
-        echo -e "7) 🛡 Настроить ${YELLOW}Телеметрию туннеля${NC} (Ping Watchdog)"
+        echo -e "7) 🤖 Настройки ${YELLOW}Telegram-бота${NC} (Уведомления)"
+        echo -e "8) 🛡 Управление ${CYAN}мониторингом туннелей${NC} (Watchdog)"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -361,7 +478,8 @@ show_menu() {
             4) list_active_rules ;;
             5) delete_single_rule ;;
             6) flush_rules_safe ;;
-            7) configure_watchdog ;;
+            7) manage_tg_bot ;;
+            8) manage_watchdog ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -369,13 +487,11 @@ show_menu() {
 }
 
 # --- МАРШРУТИЗАЦИЯ КОНТЕКСТА ИСПОЛНЕНИЯ ---
-# Фоновый запуск (Телеметрия)
 if [[ "$1" == "watchdog" ]]; then
     run_watchdog "$2" "$3"
     exit 0
 fi
 
-# Интерактивный запуск (Конфигуратор)
 check_root
 prepare_system
 show_menu

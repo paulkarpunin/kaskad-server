@@ -64,7 +64,6 @@ EOF
     fi
 
     export DEBIAN_FRONTEND=noninteractive
-    # Добавлена зависимость jq для парсинга JSON
     local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "curl" "jq")
     local MISSING_PKGS=""
 
@@ -83,36 +82,22 @@ EOF
 
 # --- ГЕНЕРАЦИЯ СТАТУСА СЕРВЕРА ---
 generate_status_report() {
-    # 1. Uptime
     local uptime_raw=$(uptime -p 2>/dev/null || echo "up unknown")
     local uptime_str=$(echo "$uptime_raw" | sed 's/up //')
-
-    # 2. CPU
     local cores=$(nproc)
     local cpu_usage=$(grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {printf "%.1f", usage}')
-
-    # 3. Load
     local load=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
-
-    # 4. RAM
     local ram_info=$(free -m | awk '/Mem:/ {print $2, $3}')
     local ram_total=$(echo "$ram_info" | awk '{print $1}')
     local ram_used=$(echo "$ram_info" | awk '{print $2}')
     local ram_pct=0
     if (( ram_total > 0 )); then ram_pct=$(( ram_used * 100 / ram_total )); fi
-
-    # 5. Swap
     local swap_info=$(free -m | awk '/Swap:/ {print $2, $3}')
     local swap_total=$(echo "$swap_info" | awk '{print $1}')
     local swap_used=$(echo "$swap_info" | awk '{print $2}')
-
-    # 6. Disk
     local disk_str=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
-
-    # 7. Топ CPU
     local top_procs=$(ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 7 | awk 'NR>1 {printf "%-7s %-5s %-5s %s\n", $1, $2" %", $3" %", $4}')
 
-    # Сборка HTML-сообщения
     local msg="<b>Uptime:</b> up ${uptime_str}%0A"
     msg+="<b>CPU:</b> ${cores} ядер | ${cpu_usage}%%0A"
     msg+="<b>Load:</b> ${load}%0A"
@@ -121,7 +106,6 @@ generate_status_report() {
     msg+="<b>Disk /:</b> ${disk_str}%0A%0A"
     msg+="<b>Топ CPU:</b>%0A"
     msg+="<pre><code class=\"language-bash\">PID     CPU%  MEM%  CMD%0A${top_procs}</code></pre>"
-
     echo "$msg"
 }
 
@@ -133,15 +117,21 @@ run_tg_listener() {
     local OFFSET_FILE="/tmp/gokaskad_tg_offset"
     local OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
+    tg_reply() {
+        local text="$1"
+        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d text="${text}" \
+            -d parse_mode="HTML" > /dev/null
+    }
+
     while true; do
-        # Long Polling (сервер Telegram держит соединение до 30 секунд, пока не появится сообщение)
         local RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/getUpdates" \
             -d "offset=${OFFSET}" -d "timeout=30" -d "allowed_updates=[\"message\"]")
         
         local OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null)
         
         if [[ "$OK" == "true" ]]; then
-            # Парсинг массива сообщений
             local MESSAGES=$(echo "$RESPONSE" | jq -c '.result[] | {update_id: .update_id, chat_id: .message.chat.id, text: .message.text}' 2>/dev/null)
             
             while read -r MSG; do
@@ -151,19 +141,70 @@ run_tg_listener() {
                 local CHAT_ID=$(echo "$MSG" | jq -r '.chat_id')
                 local TEXT=$(echo "$MSG" | jq -r '.text')
                 
-                # Сдвиг смещения, чтобы не читать сообщение дважды
                 OFFSET=$((UPD_ID + 1))
                 echo "$OFFSET" > "$OFFSET_FILE"
                 
-                # Фильтрация по владельцу (Security Access)
+                # C2 Security: Исполняем команды только от владельца
                 if [[ "$CHAT_ID" == "$TG_CHAT_ID" ]]; then
-                    if [[ "$TEXT" == "/status" || "$TEXT" == "/start" ]]; then
-                        local REPORT=$(generate_status_report)
-                        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-                            -d chat_id="${CHAT_ID}" \
-                            -d text="${REPORT}" \
-                            -d parse_mode="HTML" > /dev/null
-                    fi
+                    # Парсинг команды и аргументов
+                    local CMD=$(echo "$TEXT" | awk '{print $1}')
+                    local ARG=$(echo "$TEXT" | awk '{print $2}')
+                    
+                    case "$CMD" in
+                        "/start" | "/help")
+                            local help_msg="🤖 <b>Панель управления gokaskad</b>%0A%0A"
+                            help_msg+="Доступные команды:%0A"
+                            help_msg+="/status — Нагрузка на сервер (CPU, RAM, Uptime)%0A"
+                            help_msg+="/list — Список активных туннелей%0A"
+                            help_msg+="/delete <code>[ID]</code> — Удалить туннель (например, /delete gokaskad_tcp_443)"
+                            tg_reply "$help_msg"
+                            ;;
+                        "/status")
+                            local REPORT=$(generate_status_report)
+                            tg_reply "$REPORT"
+                            ;;
+                        "/list")
+                            local list_msg="🌐 <b>Активные переадресации:</b>%0A%0A"
+                            local tunnels_found=0
+                            
+                            while read -r line; do
+                                local l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
+                                local l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
+                                local l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+                                local l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
+                                
+                                if [[ -n "$l_id" ]]; then
+                                    list_msg+="ID: <code>$l_id</code>%0AВход: $l_port ($l_proto)%0AЦель: $l_dest%0A%0A"
+                                    tunnels_found=1
+                                fi
+                            done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
+                            
+                            if [[ $tunnels_found -eq 0 ]]; then
+                                tg_reply "Туннелей не найдено. Сервер чист."
+                            else
+                                tg_reply "$list_msg"
+                            fi
+                            ;;
+                        "/delete")
+                            if [[ -z "$ARG" ]]; then
+                                tg_reply "⚠️ Ошибка синтаксиса.%0AИспользуйте: <code>/delete [ID_ТУННЕЛЯ]</code>"
+                            else
+                                # Проверка существования туннеля
+                                if iptables-save | grep -q "$ARG"; then
+                                    # Атомарное удаление
+                                    iptables-save | grep -v "$ARG" | iptables-restore
+                                    netfilter-persistent save > /dev/null
+                                    # Очистка крона
+                                    crontab -l 2>/dev/null | grep -v "$ARG" | crontab -
+                                    rm -f "/tmp/gokaskad_wd_${ARG}.state"
+                                    
+                                    tg_reply "✅ Туннель <code>$ARG</code> успешно демаршрутизирован и удален."
+                                else
+                                    tg_reply "❌ Туннель <code>$ARG</code> не найден в ядре системы."
+                                fi
+                            fi
+                            ;;
+                    esac
                 fi
             done <<< "$MESSAGES"
         fi
@@ -251,15 +292,13 @@ manage_tg_bot() {
         fi
         local chat_id="${TG_CHAT_ID:-[Не задан]}"
         
-        # Статус крона (алерты)
         local alert_status="${TG_ALERTS_ENABLED:-1}"
         local alert_text="${GREEN}ВКЛЮЧЕНЫ${NC}"
         [[ "$alert_status" == "0" ]] && alert_text="${RED}ОСТАНОВЛЕНЫ${NC}"
 
-        # Статус системного демона (интерактивный бот)
         local daemon_status="${RED}ВЫКЛЮЧЕН${NC}"
         if systemctl is-active --quiet gokaskad-bot.service 2>/dev/null; then
-            daemon_status="${GREEN}РАБОТАЕТ${NC} (Команда /status активна)"
+            daemon_status="${GREEN}РАБОТАЕТ${NC} (Команды /status, /list активны)"
         fi
 
         echo -e "Токен бота  : ${CYAN}$masked_token${NC}"
@@ -302,9 +341,7 @@ manage_tg_bot() {
                     fi
                     chmod 600 "$WATCHDOG_CONF"
                     
-                    # Перезапуск службы, если она работала, для применения нового токена
                     systemctl is-active --quiet gokaskad-bot.service && systemctl restart gokaskad-bot.service
-                    
                     echo -e "${GREEN}[OK] Данные бота успешно обновлены.${NC}"
                     sleep 1
                 fi
@@ -327,7 +364,6 @@ manage_tg_bot() {
                         systemctl daemon-reload
                         echo -e "\n${GREEN}[OK] Служба интерактивного бота остановлена.${NC}"
                     else
-                        # Генерация и запуск systemd-юнита
                         cat <<EOF > "$BOT_SERVICE"
 [Unit]
 Description=gokaskad Telegram Interactive Bot
@@ -344,7 +380,7 @@ WantedBy=multi-user.target
 EOF
                         systemctl daemon-reload
                         systemctl enable --now gokaskad-bot.service >/dev/null 2>&1
-                        echo -e "\n${GREEN}[OK] Служба бота успешно запущена! Напишите /status в свой бот.${NC}"
+                        echo -e "\n${GREEN}[OK] Служба бота успешно запущена! Напишите /help в свой бот.${NC}"
                     fi
                     read -p "Нажмите Enter..."
                 fi
@@ -651,19 +687,16 @@ show_menu() {
 }
 
 # --- МАРШРУТИЗАЦИЯ КОНТЕКСТА ИСПОЛНЕНИЯ ---
-# 1. Запуск интерактивного бота
 if [[ "$1" == "tg_listener" ]]; then
     run_tg_listener
     exit 0
 fi
 
-# 2. Запуск телеметриста (cron)
 if [[ "$1" == "watchdog" ]]; then
     run_watchdog "$2" "$3"
     exit 0
 fi
 
-# 3. Интерактивное меню
 check_root
 prepare_system
 show_menu

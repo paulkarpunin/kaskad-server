@@ -675,7 +675,7 @@ show_menu() {
     while true; do
         clear
         echo -e "${MAGENTA}******************************************************"
-        echo -e "       1gokaskad - Интеллектуальный NAT-маршрутизатор"
+        echo -e "     gokaskad - Интеллектуальный NAT-маршрутизатор"
         echo -e "******************************************************${NC}"
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"

@@ -21,6 +21,11 @@
 ```
 wget -O install.sh https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh && chmod +x install.sh && ./install.sh
 ```
+или
+
+```
+bash <(curl -Ls https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh)
+```
 
 ## ⚙️ Системные требования:
 

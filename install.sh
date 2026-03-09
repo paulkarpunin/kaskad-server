@@ -12,6 +12,7 @@ NC='\033[0m'
 # --- СИСТЕМНЫЕ ДИРЕКТОРИИ ---
 CONFIG_DIR="/etc/gokaskad"
 WATCHDOG_CONF="$CONFIG_DIR/watchdog.conf"
+BOT_SERVICE="/etc/systemd/system/gokaskad-bot.service"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 check_root() {
@@ -43,7 +44,7 @@ load_tg_config() {
 prepare_system() {
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
         if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]]; then
-            curl -sL "https://raw.githubusercontent.com/paulkarpunin/server-kaskad/main/install.sh" -o "/usr/local/bin/gokaskad"
+            curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "/usr/local/bin/gokaskad"
         else
             cp -f "$0" "/usr/local/bin/gokaskad"
         fi
@@ -63,7 +64,8 @@ EOF
     fi
 
     export DEBIAN_FRONTEND=noninteractive
-    local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "curl")
+    # Добавлена зависимость jq для парсинга JSON
+    local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "curl" "jq")
     local MISSING_PKGS=""
 
     for pkg in "${REQUIRED_PKGS[@]}"; do
@@ -77,6 +79,96 @@ EOF
         apt-get update -y > /dev/null
         apt-get install -y $MISSING_PKGS > /dev/null
     fi
+}
+
+# --- ГЕНЕРАЦИЯ СТАТУСА СЕРВЕРА ---
+generate_status_report() {
+    # 1. Uptime
+    local uptime_raw=$(uptime -p 2>/dev/null || echo "up unknown")
+    local uptime_str=$(echo "$uptime_raw" | sed 's/up //')
+
+    # 2. CPU
+    local cores=$(nproc)
+    local cpu_usage=$(grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {printf "%.1f", usage}')
+
+    # 3. Load
+    local load=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
+
+    # 4. RAM
+    local ram_info=$(free -m | awk '/Mem:/ {print $2, $3}')
+    local ram_total=$(echo "$ram_info" | awk '{print $1}')
+    local ram_used=$(echo "$ram_info" | awk '{print $2}')
+    local ram_pct=0
+    if (( ram_total > 0 )); then ram_pct=$(( ram_used * 100 / ram_total )); fi
+
+    # 5. Swap
+    local swap_info=$(free -m | awk '/Swap:/ {print $2, $3}')
+    local swap_total=$(echo "$swap_info" | awk '{print $1}')
+    local swap_used=$(echo "$swap_info" | awk '{print $2}')
+
+    # 6. Disk
+    local disk_str=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
+
+    # 7. Топ CPU
+    local top_procs=$(ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 7 | awk 'NR>1 {printf "%-7s %-5s %-5s %s\n", $1, $2" %", $3" %", $4}')
+
+    # Сборка HTML-сообщения
+    local msg="<b>Uptime:</b> up ${uptime_str}%0A"
+    msg+="<b>CPU:</b> ${cores} ядер | ${cpu_usage}%%0A"
+    msg+="<b>Load:</b> ${load}%0A"
+    msg+="<b>RAM:</b> ${ram_used}/${ram_total}MB (${ram_pct}%%)%0A"
+    msg+="<b>Swap:</b> ${swap_used}/${swap_total}MB%0A"
+    msg+="<b>Disk /:</b> ${disk_str}%0A%0A"
+    msg+="<b>Топ CPU:</b>%0A"
+    msg+="<pre><code class=\"language-bash\">PID     CPU%  MEM%  CMD%0A${top_procs}</code></pre>"
+
+    echo "$msg"
+}
+
+# --- ИНТЕРАКТИВНЫЙ БОТ (СЛУШАТЕЛЬ) ---
+run_tg_listener() {
+    load_tg_config
+    [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && exit 1
+
+    local OFFSET_FILE="/tmp/gokaskad_tg_offset"
+    local OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
+
+    while true; do
+        # Long Polling (сервер Telegram держит соединение до 30 секунд, пока не появится сообщение)
+        local RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/getUpdates" \
+            -d "offset=${OFFSET}" -d "timeout=30" -d "allowed_updates=[\"message\"]")
+        
+        local OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null)
+        
+        if [[ "$OK" == "true" ]]; then
+            # Парсинг массива сообщений
+            local MESSAGES=$(echo "$RESPONSE" | jq -c '.result[] | {update_id: .update_id, chat_id: .message.chat.id, text: .message.text}' 2>/dev/null)
+            
+            while read -r MSG; do
+                [[ -z "$MSG" ]] && continue
+                
+                local UPD_ID=$(echo "$MSG" | jq -r '.update_id')
+                local CHAT_ID=$(echo "$MSG" | jq -r '.chat_id')
+                local TEXT=$(echo "$MSG" | jq -r '.text')
+                
+                # Сдвиг смещения, чтобы не читать сообщение дважды
+                OFFSET=$((UPD_ID + 1))
+                echo "$OFFSET" > "$OFFSET_FILE"
+                
+                # Фильтрация по владельцу (Security Access)
+                if [[ "$CHAT_ID" == "$TG_CHAT_ID" ]]; then
+                    if [[ "$TEXT" == "/status" || "$TEXT" == "/start" ]]; then
+                        local REPORT=$(generate_status_report)
+                        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                            -d chat_id="${CHAT_ID}" \
+                            -d text="${REPORT}" \
+                            -d parse_mode="HTML" > /dev/null
+                    fi
+                fi
+            done <<< "$MESSAGES"
+        fi
+        sleep 2
+    done
 }
 
 # --- МОДУЛЬ WATCHDOG (ФОНОВЫЙ ТЕЛЕМЕТРИСТ) ---
@@ -157,24 +249,39 @@ manage_tg_bot() {
                 masked_token="***"
             fi
         fi
-        
         local chat_id="${TG_CHAT_ID:-[Не задан]}"
         
-        local status="${TG_ALERTS_ENABLED:-1}"
-        local status_text="${GREEN}ВКЛЮЧЕНА${NC} (Алерты отправляются)"
-        [[ "$status" == "0" ]] && status_text="${RED}ОСТАНОВЛЕНА${NC} (Алерты на паузе)"
+        # Статус крона (алерты)
+        local alert_status="${TG_ALERTS_ENABLED:-1}"
+        local alert_text="${GREEN}ВКЛЮЧЕНЫ${NC}"
+        [[ "$alert_status" == "0" ]] && alert_text="${RED}ОСТАНОВЛЕНЫ${NC}"
 
-        echo -e "Токен бота : ${CYAN}$masked_token${NC}"
-        echo -e "Chat ID    : ${CYAN}$chat_id${NC}"
-        echo -e "Служба ТГ  : $status_text\n"
+        # Статус системного демона (интерактивный бот)
+        local daemon_status="${RED}ВЫКЛЮЧЕН${NC}"
+        if systemctl is-active --quiet gokaskad-bot.service 2>/dev/null; then
+            daemon_status="${GREEN}РАБОТАЕТ${NC} (Команда /status активна)"
+        fi
+
+        echo -e "Токен бота  : ${CYAN}$masked_token${NC}"
+        echo -e "Chat ID     : ${CYAN}$chat_id${NC}"
+        echo -e "Алерты сети : $alert_text"
+        echo -e "Интерактив  : $daemon_status\n"
 
         echo -e "1) Изменить Token и Chat ID"
-        if [[ "$status" == "1" ]]; then
-            echo -e "2) ${RED}Выключить${NC} службу отправки уведомлений"
+        
+        if [[ "$alert_status" == "1" ]]; then
+            echo -e "2) ${RED}Выключить${NC} автоматические алерты деградации сети"
         else
-            echo -e "2) ${GREEN}Включить${NC} службу отправки уведомлений"
+            echo -e "2) ${GREEN}Включить${NC} автоматические алерты деградации сети"
         fi
-        echo -e "3) ✉️  Отправить тестовое сообщение"
+
+        if systemctl is-active --quiet gokaskad-bot.service 2>/dev/null; then
+            echo -e "3) ${RED}Остановить${NC} службу интерактивного бота"
+        else
+            echo -e "3) ${GREEN}Запустить${NC} службу интерактивного бота"
+        fi
+
+        echo -e "4) ✉️  Отправить тестовое сообщение"
         echo -e "0) Назад"
         
         read -p "Ваш выбор: " choice
@@ -194,40 +301,72 @@ manage_tg_bot() {
                         echo "TG_ALERTS_ENABLED=\"1\"" >> "$WATCHDOG_CONF"
                     fi
                     chmod 600 "$WATCHDOG_CONF"
+                    
+                    # Перезапуск службы, если она работала, для применения нового токена
+                    systemctl is-active --quiet gokaskad-bot.service && systemctl restart gokaskad-bot.service
+                    
                     echo -e "${GREEN}[OK] Данные бота успешно обновлены.${NC}"
                     sleep 1
                 fi
                 ;;
             2)
                 local new_status="1"
-                [[ "$status" == "1" ]] && new_status="0"
+                [[ "$alert_status" == "1" ]] && new_status="0"
                 
                 [[ -f "$WATCHDOG_CONF" ]] && sed -i '/TG_ALERTS_ENABLED/d' "$WATCHDOG_CONF"
                 echo "TG_ALERTS_ENABLED=\"$new_status\"" >> "$WATCHDOG_CONF"
                 ;;
             3)
                 if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+                    echo -e "\n${RED}[ОШИБКА] Настройте Токен и Chat ID перед запуском службы.${NC}"
+                    read -p "Нажмите Enter..."
+                else
+                    if systemctl is-active --quiet gokaskad-bot.service 2>/dev/null; then
+                        systemctl disable --now gokaskad-bot.service >/dev/null 2>&1
+                        rm -f "$BOT_SERVICE"
+                        systemctl daemon-reload
+                        echo -e "\n${GREEN}[OK] Служба интерактивного бота остановлена.${NC}"
+                    else
+                        # Генерация и запуск systemd-юнита
+                        cat <<EOF > "$BOT_SERVICE"
+[Unit]
+Description=gokaskad Telegram Interactive Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gokaskad tg_listener
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                        systemctl daemon-reload
+                        systemctl enable --now gokaskad-bot.service >/dev/null 2>&1
+                        echo -e "\n${GREEN}[OK] Служба бота успешно запущена! Напишите /status в свой бот.${NC}"
+                    fi
+                    read -p "Нажмите Enter..."
+                fi
+                ;;
+            4)
+                if [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]]; then
                     echo -e "\n${RED}[ОШИБКА] Токен или Chat ID не заданы. Сначала выполните пункт 1.${NC}"
                 else
                     echo -e "\n${YELLOW}[*] Отправка тестового запроса к API Telegram...${NC}"
                     local test_msg="✅ <b>Тестовое сообщение</b>%0AИнтеграция с маршрутизатором gokaskad настроена корректно!"
                     
-                    # Отправка запроса с захватом HTTP кода ответа
                     local response=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                         -d chat_id="${TG_CHAT_ID}" \
                         -d text="${test_msg}" \
                         -d parse_mode="HTML")
                     
-                    # Извлечение последней строки (HTTP код)
                     local http_code=$(echo "$response" | tail -n1)
                     
                     if [[ "$http_code" == "200" ]]; then
                         echo -e "${GREEN}[SUCCESS] Сообщение успешно доставлено в ваш Telegram!${NC}"
                     else
-                        echo -e "${RED}[ERROR] Сбой интеграции. Код ответа сервера Telegram: $http_code${NC}"
-                        echo -e "${CYAN}Убедитесь, что:${NC}"
-                        echo -e "1. Вы скопировали Токен и Chat ID без лишних пробелов."
-                        echo -e "2. Вы нажали кнопку /start в диалоге с вашим ботом."
+                        echo -e "${RED}[ERROR] Сбой интеграции. Код ответа сервера: $http_code${NC}"
                     fi
                 fi
                 read -p "Нажмите Enter для возврата..."
@@ -345,7 +484,6 @@ remove_watchdog_rule() {
     read -p "Нажмите Enter..."
 }
 
-
 # --- МАРШРУТИЗАЦИЯ И ПРАВИЛА ---
 configure_rule() {
     local PROTO=$1
@@ -461,7 +599,7 @@ delete_single_rule() {
     crontab -l 2>/dev/null | grep -v "$target_id" | crontab -
     rm -f "/tmp/gokaskad_wd_${target_id}.state"
 
-    echo -e "${GREEN}[OK] Туннель $target_id и его задачи мониторинга демаршрутизированы.${NC}"
+    echo -e "${GREEN}[OK] Туннель $target_id и задачи мониторинга удалены.${NC}"
     read -p "Нажмите Enter..."
 }
 
@@ -513,11 +651,19 @@ show_menu() {
 }
 
 # --- МАРШРУТИЗАЦИЯ КОНТЕКСТА ИСПОЛНЕНИЯ ---
+# 1. Запуск интерактивного бота
+if [[ "$1" == "tg_listener" ]]; then
+    run_tg_listener
+    exit 0
+fi
+
+# 2. Запуск телеметриста (cron)
 if [[ "$1" == "watchdog" ]]; then
     run_watchdog "$2" "$3"
     exit 0
 fi
 
+# 3. Интерактивное меню
 check_root
 prepare_system
 show_menu

@@ -1,0 +1,31 @@
+name: ShellCheck CI
+
+# 1. Системные триггеры
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - '**.sh'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '**.sh'
+
+# 2. Определение вычислительной среды
+jobs:
+  analyze-bash:
+    name: Bash Code Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      # Шаг 1: Клонирование репозитория в эфемерный контейнер
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Шаг 2: Запуск статического анализатора
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './'
+          severity: warning
+          # ignore: SC2086,SC2155 # Раскомментируйте эту строку для точечного подавления правил, если парсер будет слишком строг

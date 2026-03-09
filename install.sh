@@ -144,9 +144,7 @@ run_tg_listener() {
                 OFFSET=$((UPD_ID + 1))
                 echo "$OFFSET" > "$OFFSET_FILE"
                 
-                # C2 Security: Исполняем команды только от владельца
                 if [[ "$CHAT_ID" == "$TG_CHAT_ID" ]]; then
-                    # Парсинг команды и аргументов
                     local CMD=$(echo "$TEXT" | awk '{print $1}')
                     local ARG=$(echo "$TEXT" | awk '{print $2}')
                     
@@ -156,7 +154,8 @@ run_tg_listener() {
                             help_msg+="Доступные команды:%0A"
                             help_msg+="/status — Нагрузка на сервер (CPU, RAM, Uptime)%0A"
                             help_msg+="/list — Список активных туннелей%0A"
-                            help_msg+="/delete <code>[ID]</code> — Удалить туннель (например, /delete gokaskad_tcp_443)"
+                            help_msg+="/delete <code>[ID]</code> — Удалить туннель%0A"
+                            help_msg+="/update — Бесшовное обновление скрипта с GitHub"
                             tg_reply "$help_msg"
                             ;;
                         "/status")
@@ -189,19 +188,38 @@ run_tg_listener() {
                             if [[ -z "$ARG" ]]; then
                                 tg_reply "⚠️ Ошибка синтаксиса.%0AИспользуйте: <code>/delete [ID_ТУННЕЛЯ]</code>"
                             else
-                                # Проверка существования туннеля
                                 if iptables-save | grep -q "$ARG"; then
-                                    # Атомарное удаление
                                     iptables-save | grep -v "$ARG" | iptables-restore
                                     netfilter-persistent save > /dev/null
-                                    # Очистка крона
                                     crontab -l 2>/dev/null | grep -v "$ARG" | crontab -
                                     rm -f "/tmp/gokaskad_wd_${ARG}.state"
-                                    
                                     tg_reply "✅ Туннель <code>$ARG</code> успешно демаршрутизирован и удален."
                                 else
                                     tg_reply "❌ Туннель <code>$ARG</code> не найден в ядре системы."
                                 fi
+                            fi
+                            ;;
+                        "/update")
+                            tg_reply "🔄 <b>Инициализация обновления...</b>%0AУстановка соединения с GitHub репозиторием."
+                            local TMP_FILE="/tmp/gokaskad_update.sh"
+                            
+                            if curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "$TMP_FILE"; then
+                                # Валидация скачанного файла (защита от битых загрузок)
+                                if grep -q "#!/bin/bash" "$TMP_FILE"; then
+                                    # Атомарная перезапись системного бинарника
+                                    cat "$TMP_FILE" > "/usr/local/bin/gokaskad"
+                                    chmod +x "/usr/local/bin/gokaskad"
+                                    rm -f "$TMP_FILE"
+                                    
+                                    tg_reply "✅ <b>Обновление успешно загружено и интегрировано!</b>%0AВыполняется асинхронный перезапуск демона..."
+                                    
+                                    # Отсоединенный процесс для перезагрузки службы (позволяет циклу корректно закрыться)
+                                    (sleep 2 && systemctl restart gokaskad-bot.service) &
+                                else
+                                    tg_reply "❌ <b>Критическая ошибка:</b> Скачанный файл не прошел валидацию. Обновление прервано."
+                                fi
+                            else
+                                tg_reply "❌ <b>Сетевой сбой:</b> Не удалось подключиться к GitHub."
                             fi
                             ;;
                     esac

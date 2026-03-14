@@ -738,23 +738,36 @@ install_warp() {
     }
 
     echo -e "${YELLOW}[*] Загрузка wgcf (WARP WireGuard configurator)...${NC}"
-    local ARCH ARCH_TAG WGCF_URL
+    local ARCH ARCH_TAG WGCF_URL VERSION
     ARCH=$(uname -m)
     ARCH_TAG="amd64"
     [[ "$ARCH" == "aarch64" ]] && ARCH_TAG="arm64"
 
-    # Получаем актуальный URL через GitHub API
-    # grep -E "...$" — берём только сырой бинарь, исключая .deb/.rpm/.tar.gz
-    WGCF_URL=$(curl -s "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
-        | grep -oP '"browser_download_url": "\K[^"]+' \
-        | grep -E "linux_${ARCH_TAG}$" | head -n1)
+    # Метод 1: парсим версию из HTTP-редиректа /releases/latest → /releases/tag/vX.Y.Z
+    # Быстро, без API rate limits, без JSON
+    VERSION=$(curl -fsSL --max-time 10 -o /dev/null -w '%{url_effective}' \
+        "https://github.com/ViRb3/wgcf/releases/latest" 2>/dev/null \
+        | grep -oP 'tag/v\K[^/]+')
+
+    if [[ -n "$VERSION" ]]; then
+        WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${VERSION}/wgcf_${VERSION}_linux_${ARCH_TAG}"
+        echo -e "${CYAN}[i] Найдена версия: ${VERSION}${NC}"
+    else
+        # Метод 2: GitHub API с таймаутом (запасной)
+        echo -e "${YELLOW}[*] Редирект недоступен, пробуем GitHub API (до 15 сек)...${NC}"
+        WGCF_URL=$(curl -fsS --max-time 15 \
+            "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null \
+            | grep -oP '"browser_download_url": "\K[^"]+' \
+            | grep -E "linux_${ARCH_TAG}$" | head -n1)
+    fi
 
     if [[ -z "$WGCF_URL" ]]; then
         echo -e "${RED}[ERROR] Не удалось получить URL загрузки wgcf с GitHub.${NC}"; return 1
     fi
 
-    if ! curl -sL "$WGCF_URL" -o /usr/local/bin/wgcf; then
-        echo -e "${RED}[ERROR] Не удалось загрузить wgcf.${NC}"; return 1
+    echo -e "${YELLOW}[*] Скачивание бинаря...${NC}"
+    if ! curl -fsSL --max-time 120 "$WGCF_URL" -o /usr/local/bin/wgcf; then
+        echo -e "${RED}[ERROR] Не удалось загрузить wgcf (URL: $WGCF_URL).${NC}"; return 1
     fi
     chmod +x /usr/local/bin/wgcf
 

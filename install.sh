@@ -46,7 +46,7 @@ prepare_system() {
     if [ "$0" != "/usr/local/bin/gokaskad" ]; then
         if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]]; then
             # Обновленная ссылка на новый репозиторий kaskad-server
-            curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "/usr/local/bin/gokaskad"
+            curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/dev_cd/install.sh" -o "/usr/local/bin/gokaskad"
         else
             cp -f "$0" "/usr/local/bin/gokaskad"
         fi
@@ -318,7 +318,7 @@ run_tg_listener() {
                             tg_reply "🔄 <b>Инициализация обновления...</b> (текущая версия: v${SCRIPT_VERSION})"
                             local TMP_FILE="/tmp/gokaskad_update.sh"
 
-                            if curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "$TMP_FILE"; then
+                            if curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/dev_cd/install.sh" -o "$TMP_FILE"; then
                                 local MIN_SIZE=10240
                                 local file_size
                                 file_size=$(wc -c < "$TMP_FILE")

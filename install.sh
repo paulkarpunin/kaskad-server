@@ -743,10 +743,11 @@ install_warp() {
     ARCH_TAG="amd64"
     [[ "$ARCH" == "aarch64" ]] && ARCH_TAG="arm64"
 
-    # Получаем актуальный URL через GitHub API (файлы называются wgcf_VERSION_linux_ARCH)
+    # Получаем актуальный URL через GitHub API
+    # grep -E "...$" — берём только сырой бинарь, исключая .deb/.rpm/.tar.gz
     WGCF_URL=$(curl -s "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
         | grep -oP '"browser_download_url": "\K[^"]+' \
-        | grep "linux_${ARCH_TAG}" | head -n1)
+        | grep -E "linux_${ARCH_TAG}$" | head -n1)
 
     if [[ -z "$WGCF_URL" ]]; then
         echo -e "${RED}[ERROR] Не удалось получить URL загрузки wgcf с GitHub.${NC}"; return 1
@@ -757,9 +758,11 @@ install_warp() {
     fi
     chmod +x /usr/local/bin/wgcf
 
-    # Проверяем что скачан валидный бинарь, а не HTML-страница ошибки
-    if ! /usr/local/bin/wgcf --version > /dev/null 2>&1; then
-        echo -e "${RED}[ERROR] Скачанный файл wgcf повреждён или несовместим с архитектурой ${ARCH}.${NC}"
+    # Проверяем размер: Go-бинарь весит минимум 1MB; HTML-страница ошибки — единицы KB
+    local fsize
+    fsize=$(wc -c < /usr/local/bin/wgcf 2>/dev/null || echo 0)
+    if (( fsize < 1048576 )); then
+        echo -e "${RED}[ERROR] Скачанный файл wgcf слишком мал (${fsize} байт) — возможно, GitHub API вернул ошибку.${NC}"
         rm -f /usr/local/bin/wgcf
         return 1
     fi

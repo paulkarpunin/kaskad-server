@@ -20,6 +20,16 @@ WARP_MARK=200
 WARP_TABLE=200
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+save_rules() {
+    if command -v netfilter-persistent &>/dev/null; then
+        save_rules 2>&1
+    else
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    fi
+}
+
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}[ERROR] Критический сбой: Требуются права суперпользователя (root).${NC}"
@@ -336,7 +346,7 @@ run_tg_listener() {
                                     grep -Fxq "$ARG" "$WARP_TUNNELS_FILE" 2>/dev/null && \
                                         remove_warp_mark "$ARG" "$d_proto" "$d_port"
                                     iptables-save | grep -Fv "$ARG" | iptables-restore
-                                    netfilter-persistent save > /dev/null
+                                    save_rules
                                     crontab -l 2>/dev/null | grep -Fv "$ARG" | crontab -
                                     rm -f "/tmp/gokaskad_wd_${ARG}.state"
                                     tg_reply "✅ Туннель <code>$ARG</code> успешно демаршрутизирован."
@@ -645,7 +655,7 @@ apply_iptables_rules() {
         ufw reload >/dev/null
     fi
 
-    netfilter-persistent save > /dev/null
+    save_rules
     
     if [[ "$SILENT" == "0" ]]; then
         echo -e "${GREEN}[SUCCESS] Туннель $CASCADE_ID маршрутизирован.${NC}"
@@ -708,7 +718,7 @@ delete_single_rule() {
         remove_warp_mark "$target_id" "$t_proto" "$t_port"
 
     iptables-save | grep -v "$target_id" | iptables-restore
-    netfilter-persistent save > /dev/null
+    save_rules
 
     crontab -l 2>/dev/null | grep -v "$target_id" | crontab -
     rm -f "/tmp/gokaskad_wd_${target_id}.state"
@@ -839,7 +849,7 @@ apply_warp_mark() {
     # Регистрируем туннель в файле отслеживания
     touch "$WARP_TUNNELS_FILE"
     grep -Fxq "$CASCADE_ID" "$WARP_TUNNELS_FILE" || echo "$CASCADE_ID" >> "$WARP_TUNNELS_FILE"
-    netfilter-persistent save > /dev/null
+    save_rules
 }
 
 remove_warp_mark() {
@@ -859,7 +869,7 @@ remove_warp_mark() {
     if [[ ! -s "$WARP_TUNNELS_FILE" ]]; then
         systemctl disable --now wg-quick@wgcf > /dev/null 2>&1
     fi
-    netfilter-persistent save > /dev/null
+    save_rules
 }
 
 import_warp_config() {
@@ -995,7 +1005,7 @@ flush_rules_safe() {
     read -p "Будут удалены ВСЕ правила маршрутизации и задачи мониторинга. Подтвердить? (y/n): " confirm
     if [[ "$confirm" == "y" ]]; then
         iptables-save | grep -v "gokaskad_" | iptables-restore
-        netfilter-persistent save > /dev/null
+        save_rules
         crontab -l 2>/dev/null | grep -v "gokaskad watchdog" | crontab -
         rm -f /tmp/gokaskad_wd_*.state
         # Очистка WARP

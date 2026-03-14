@@ -872,6 +872,73 @@ remove_warp_mark() {
     save_rules
 }
 
+toggle_warp_for_tunnels() {
+    if ! check_warp_installed; then
+        echo -e "${RED}[ERROR] WARP не установлен. Сначала установите WARP.${NC}"
+        read -p "Нажмите Enter..."; return
+    fi
+
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- ⚡ Включить / Выключить WARP для туннеля ---${NC}\n"
+        echo -e "${CYAN}Выберите туннель для переключения:${NC}\n"
+
+        declare -A TUNNELS
+        local i=1
+
+        while read -r line; do
+            local l_id
+            l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
+            [[ -z "$l_id" ]] && continue
+            TUNNELS[$i]="$l_id"
+
+            local warp_marker
+            if [[ -f "$WARP_TUNNELS_FILE" ]] && grep -Fxq "$l_id" "$WARP_TUNNELS_FILE" 2>/dev/null; then
+                warp_marker="${GREEN}● WARP ВКЛ${NC}"
+            else
+                warp_marker="${YELLOW}○ WARP ВЫКЛ${NC}"
+            fi
+            echo -e "  ${WHITE}[$i]${NC} $l_id  —  $warp_marker"
+            ((i++))
+        done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
+
+        if [[ ${#TUNNELS[@]} -eq 0 ]]; then
+            echo -e "${YELLOW}Активных туннелей не найдено.${NC}"
+            read -p "Нажмите Enter..."; return
+        fi
+
+        echo ""
+        read -p "Введите номер туннеля (0 — назад): " sel
+        [[ "$sel" == "0" || -z "$sel" ]] && return
+
+        local SELECTED="${TUNNELS[$sel]}"
+        if [[ -z "$SELECTED" ]]; then
+            echo -e "${RED}Неверный выбор.${NC}"; sleep 1; continue
+        fi
+
+        # Парсим proto и port из ID вида gokaskad_<proto>_<port>
+        local PROTO IN_PORT
+        IFS='_' read -r _ PROTO IN_PORT <<< "$SELECTED"
+
+        if [[ -f "$WARP_TUNNELS_FILE" ]] && grep -Fxq "$SELECTED" "$WARP_TUNNELS_FILE" 2>/dev/null; then
+            remove_warp_mark "$SELECTED" "$PROTO" "$IN_PORT"
+            echo -e "\n${GREEN}[OK] WARP отключён для туннеля ${WHITE}$SELECTED${NC}."
+        else
+            # При включении — убедиться что wg-quick запущен
+            if ! systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
+                systemctl start wg-quick@wgcf 2>/dev/null || {
+                    echo -e "${RED}[ERROR] Не удалось запустить WARP-интерфейс.${NC}"
+                    read -p "Нажмите Enter..."; continue
+                }
+            fi
+            apply_warp_mark "$SELECTED" "$PROTO" "$IN_PORT"
+            echo -e "\n${GREEN}[OK] WARP включён для туннеля ${WHITE}$SELECTED${NC}."
+        fi
+        read -p "Нажмите Enter..."
+        unset TUNNELS
+    done
+}
+
 import_warp_config() {
     clear
     echo -e "${MAGENTA}--- 📥 Ручной импорт конфигурации WARP ---${NC}\n"
@@ -957,11 +1024,13 @@ manage_warp() {
             echo -e "1) ${GREEN}Установить${NC} WARP (авто — требует доступ к Cloudflare)"
             echo -e "2) ${CYAN}Импортировать${NC} конфиг вручную (для серверов с ограниченным доступом)"
         elif systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
-            echo -e "1) ${RED}Отключить${NC} WARP"
+            echo -e "1) ${RED}Отключить${NC} WARP (глобально)"
             echo -e "2) Показать туннели через WARP"
+            echo -e "3) ${CYAN}⚡ Включить / выключить${NC} WARP для конкретного туннеля"
         else
-            echo -e "1) ${GREEN}Подключить${NC} WARP"
+            echo -e "1) ${GREEN}Подключить${NC} WARP (глобально)"
             echo -e "2) Показать туннели через WARP"
+            echo -e "3) ${CYAN}⚡ Включить / выключить${NC} WARP для конкретного туннеля"
         fi
         echo -e "0) Назад"
 
@@ -992,8 +1061,11 @@ manage_warp() {
                     else
                         echo -e "${YELLOW}Нет активных WARP-туннелей.${NC}"
                     fi
+                    read -p "Нажмите Enter..."
                 fi
-                read -p "Нажмите Enter..."
+                ;;
+            3)
+                toggle_warp_for_tunnels
                 ;;
             0) return ;;
         esac

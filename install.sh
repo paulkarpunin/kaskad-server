@@ -14,6 +14,10 @@ SCRIPT_VERSION="1.1"
 CONFIG_DIR="/etc/gokaskad"
 WATCHDOG_CONF="$CONFIG_DIR/watchdog.conf"
 BOT_SERVICE="/etc/systemd/system/gokaskad-bot.service"
+WARP_CONF="/etc/wireguard/wgcf.conf"
+WARP_TUNNELS_FILE="$CONFIG_DIR/warp_tunnels"
+WARP_MARK=200
+WARP_TABLE=200
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 check_root() {
@@ -142,6 +146,10 @@ generate_backup_file() {
         local thresh=$(echo "$line" | awk -F'"' '{print $4}')
         echo "$tid $thresh $period" >> "$file"
     done
+    echo "" >> "$file"
+
+    echo "[WARP]" >> "$file"
+    [[ -f "$WARP_TUNNELS_FILE" ]] && grep -v '^$' "$WARP_TUNNELS_FILE" >> "$file"
 }
 
 # --- ИНТЕРАКТИВНЫЙ БОТ (СЛУШАТЕЛЬ) ---
@@ -203,6 +211,7 @@ run_tg_listener() {
                             help_msg+="/ping <code>[ID]</code> — Проверить связь с узлом туннеля%0A"
                             help_msg+="/delete <code>[ID]</code> — Удалить туннель%0A"
                             help_msg+="/backup — Выгрузить резервную копию настроек%0A"
+                            help_msg+="/warp — Статус Cloudflare WARP%0A"
                             help_msg+="/update — Обновление скрипта с GitHub"
                             tg_reply "$help_msg"
                             ;;
@@ -248,6 +257,23 @@ run_tg_listener() {
                                     tg_reply "$ping_msg"
                                 fi
                             fi
+                            ;;
+                        "/warp")
+                            local w_status
+                            w_status=$(get_warp_status)
+                            local warp_count=0
+                            [[ -f "$WARP_TUNNELS_FILE" ]] && \
+                                warp_count=$(grep -c . "$WARP_TUNNELS_FILE" 2>/dev/null || echo 0)
+                            local warp_msg="🌐 <b>Cloudflare WARP:</b>%0A"
+                            warp_msg+="Состояние: <b>${w_status}</b>%0A"
+                            warp_msg+="Туннелей через WARP: <b>${warp_count}</b>"
+                            if [[ -f "$WARP_TUNNELS_FILE" ]] && [[ -s "$WARP_TUNNELS_FILE" ]]; then
+                                warp_msg+="%0A%0AМаршрутизируются:%0A"
+                                while IFS= read -r tid; do
+                                    warp_msg+="• <code>$tid</code>%0A"
+                                done < "$WARP_TUNNELS_FILE"
+                            fi
+                            tg_reply "$warp_msg"
                             ;;
                         "/traffic")
                             local traffic_msg="📊 <b>Статистика трафика:</b>%0A%0A"
@@ -304,6 +330,11 @@ run_tg_listener() {
                                 tg_reply "❌ Некорректный ID туннеля. Формат: <code>gokaskad_tcp_443</code>"
                             else
                                 if iptables-save | grep -Fq "$ARG"; then
+                                    local d_proto d_port
+                                    d_proto=$(echo "$ARG" | awk -F'_' '{print $2}')
+                                    d_port=$(echo "$ARG" | awk -F'_' '{print $3}')
+                                    grep -Fxq "$ARG" "$WARP_TUNNELS_FILE" 2>/dev/null && \
+                                        remove_warp_mark "$ARG" "$d_proto" "$d_port"
                                     iptables-save | grep -Fv "$ARG" | iptables-restore
                                     netfilter-persistent save > /dev/null
                                     crontab -l 2>/dev/null | grep -Fv "$ARG" | crontab -
@@ -456,6 +487,7 @@ manage_backup() {
                     fi
                     if [[ "$line" == "[TUNNELS]" ]]; then section="tunnels"; continue; fi
                     if [[ "$line" == "[CRON]" ]]; then section="cron"; continue; fi
+                    if [[ "$line" == "[WARP]" ]]; then section="warp"; continue; fi
                     
                     if [[ "$section" == "config" ]]; then
                         # Разрешаем только известные ключи вида KEY="value" без спецсимволов
@@ -490,6 +522,19 @@ manage_backup() {
                             (crontab -l 2>/dev/null | grep -Fv "$tid"; echo "*/$period * * * * $CRON_CMD") | crontab -
                         else
                             echo -e "${RED}[WARN] Пропущена некорректная запись cron: $line${NC}"
+                        fi
+                    elif [[ "$section" == "warp" ]]; then
+                        if [[ "$line" =~ ^gokaskad_[a-z]+_[0-9]+$ ]]; then
+                            local w_proto w_port
+                            w_proto=$(echo "$line" | awk -F'_' '{print $2}')
+                            w_port=$(echo "$line" | awk -F'_' '{print $3}')
+                            if check_warp_installed; then
+                                systemctl is-active --quiet wg-quick@wgcf 2>/dev/null || \
+                                    systemctl start wg-quick@wgcf > /dev/null 2>&1
+                                apply_warp_mark "$line" "$w_proto" "$w_port"
+                            else
+                                echo -e "${YELLOW}[WARN] WARP не установлен — пропускаем метку для $line.${NC}"
+                            fi
                         fi
                     fi
                 done < "$file_path"
@@ -530,7 +575,34 @@ configure_rule() {
         echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
     done
 
-    apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME" "0"
+    local USE_WARP=0
+    echo ""
+    read -p "Маршрутизировать через Cloudflare WARP? (y/n): " warp_ans
+    if [[ "$warp_ans" == "y" ]]; then
+        if ! check_warp_installed; then
+            echo -e "${YELLOW}[*] WARP не установлен. Запуск автоустановки...${NC}"
+            if install_warp; then
+                USE_WARP=1
+            else
+                echo -e "${RED}[WARN] Не удалось установить WARP. Туннель создан без него.${NC}"
+            fi
+        else
+            systemctl is-active --quiet wg-quick@wgcf 2>/dev/null || \
+                systemctl start wg-quick@wgcf > /dev/null 2>&1
+            USE_WARP=1
+        fi
+    fi
+
+    local CASCADE_ID="gokaskad_${PROTO}_${IN_PORT}"
+    apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME" "2"
+
+    if [[ "$USE_WARP" -eq 1 ]]; then
+        apply_warp_mark "$CASCADE_ID" "$PROTO" "$IN_PORT"
+        echo -e "${GREEN}[SUCCESS] Туннель $CASCADE_ID маршрутизирован через Cloudflare WARP.${NC}"
+    else
+        echo -e "${GREEN}[SUCCESS] Туннель $CASCADE_ID маршрутизирован.${NC}"
+    fi
+    read -p "Нажмите Enter..."
 }
 
 apply_iptables_rules() {
@@ -550,7 +622,7 @@ apply_iptables_rules() {
         return
     fi
 
-    [[ "$SILENT" != "1" ]] && echo -e "${YELLOW}[*] Компиляция правил...${NC}"
+    [[ "$SILENT" == "0" ]] && echo -e "${YELLOW}[*] Компиляция правил...${NC}"
 
     iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
     iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
@@ -575,12 +647,13 @@ apply_iptables_rules() {
 
     netfilter-persistent save > /dev/null
     
-    if [[ "$SILENT" != "1" ]]; then
+    if [[ "$SILENT" == "0" ]]; then
         echo -e "${GREEN}[SUCCESS] Туннель $CASCADE_ID маршрутизирован.${NC}"
         read -p "Нажмите Enter..."
-    else
+    elif [[ "$SILENT" == "1" ]]; then
         echo -e "${GREEN}[OK] Восстановлен: $CASCADE_ID${NC}"
     fi
+    # SILENT="2": тихий режим — вывод управляется вызывающей стороной
 }
 
 list_active_rules() {
@@ -626,7 +699,14 @@ delete_single_rule() {
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
 
     local target_id="${RULES_LIST[$rule_num]}"
-    
+
+    # Снять WARP-метку если туннель её использует
+    local t_proto t_port
+    t_proto=$(echo "$target_id" | awk -F'_' '{print $2}')
+    t_port=$(echo "$target_id" | awk -F'_' '{print $3}')
+    grep -Fxq "$target_id" "$WARP_TUNNELS_FILE" 2>/dev/null && \
+        remove_warp_mark "$target_id" "$t_proto" "$t_port"
+
     iptables-save | grep -v "$target_id" | iptables-restore
     netfilter-persistent save > /dev/null
 
@@ -637,6 +717,165 @@ delete_single_rule() {
     read -p "Нажмите Enter..."
 }
 
+# --- CLOUDFLARE WARP ---
+check_warp_installed() {
+    command -v wgcf &>/dev/null && [[ -f "$WARP_CONF" ]]
+}
+
+get_warp_status() {
+    if ! check_warp_installed; then echo "НЕ УСТАНОВЛЕН"; return; fi
+    if systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
+        echo "ПОДКЛЮЧЕН"
+    else
+        echo "ОТКЛЮЧЕН"
+    fi
+}
+
+install_warp() {
+    echo -e "${YELLOW}[*] Установка wireguard-tools...${NC}"
+    apt-get install -y wireguard-tools > /dev/null 2>&1 || {
+        echo -e "${RED}[ERROR] Не удалось установить wireguard-tools.${NC}"; return 1
+    }
+
+    echo -e "${YELLOW}[*] Загрузка wgcf (WARP WireGuard configurator)...${NC}"
+    local ARCH
+    ARCH=$(uname -m)
+    local WGCF_BIN="wgcf_linux_amd64"
+    [[ "$ARCH" == "aarch64" ]] && WGCF_BIN="wgcf_linux_arm64"
+    if ! curl -sL "https://github.com/ViRb3/wgcf/releases/latest/download/${WGCF_BIN}" \
+            -o /usr/local/bin/wgcf; then
+        echo -e "${RED}[ERROR] Не удалось загрузить wgcf.${NC}"; return 1
+    fi
+    chmod +x /usr/local/bin/wgcf
+
+    echo -e "${YELLOW}[*] Регистрация бесплатного WARP-аккаунта...${NC}"
+    mkdir -p /etc/wireguard
+    cd /etc/wireguard || return 1
+    wgcf register --accept-tos > /dev/null 2>&1
+    wgcf generate > /dev/null 2>&1
+
+    if [[ ! -f /etc/wireguard/wgcf-profile.conf ]]; then
+        echo -e "${RED}[ERROR] Конфигурация WARP не была создана.${NC}"; return 1
+    fi
+
+    echo -e "${YELLOW}[*] Настройка изолированной таблицы маршрутизации (table $WARP_TABLE)...${NC}"
+    # Вставляем Table + PostUp/PostDown после [Interface], убираем DNS
+    while IFS= read -r line; do
+        echo "$line"
+        if [[ "$line" == "[Interface]" ]]; then
+            echo "Table = $WARP_TABLE"
+            echo "PostUp = ip rule add fwmark $WARP_MARK table $WARP_TABLE priority 100 2>/dev/null || true"
+            echo "PostDown = ip rule del fwmark $WARP_MARK table $WARP_TABLE 2>/dev/null || true"
+        fi
+    done < /etc/wireguard/wgcf-profile.conf | grep -v "^DNS" > "$WARP_CONF"
+    chmod 600 "$WARP_CONF"
+    rm -f /etc/wireguard/wgcf-profile.conf /etc/wireguard/wgcf-account.toml
+
+    systemctl enable --now wg-quick@wgcf > /dev/null 2>&1
+    sleep 2
+    if ! systemctl is-active --quiet wg-quick@wgcf; then
+        echo -e "${RED}[ERROR] WARP-интерфейс не поднялся. Проверьте: systemctl status wg-quick@wgcf${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[OK] WARP установлен и подключён через Cloudflare.${NC}"
+    return 0
+}
+
+apply_warp_mark() {
+    local CASCADE_ID="$1"
+    local PROTO="$2"
+    local IN_PORT="$3"
+
+    # Удаляем существующее правило (idempotent)
+    iptables -t mangle -D PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_warp" -j MARK --set-mark "$WARP_MARK" 2>/dev/null
+    # Добавляем правило маркировки
+    iptables -t mangle -A PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_warp" -j MARK --set-mark "$WARP_MARK"
+
+    # Регистрируем туннель в файле отслеживания
+    touch "$WARP_TUNNELS_FILE"
+    grep -Fxq "$CASCADE_ID" "$WARP_TUNNELS_FILE" || echo "$CASCADE_ID" >> "$WARP_TUNNELS_FILE"
+    netfilter-persistent save > /dev/null
+}
+
+remove_warp_mark() {
+    local CASCADE_ID="$1"
+    local PROTO="$2"
+    local IN_PORT="$3"
+
+    iptables -t mangle -D PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_warp" -j MARK --set-mark "$WARP_MARK" 2>/dev/null
+
+    if [[ -f "$WARP_TUNNELS_FILE" ]]; then
+        grep -Fxv "$CASCADE_ID" "$WARP_TUNNELS_FILE" > /tmp/gokaskad_warp_tmp
+        mv /tmp/gokaskad_warp_tmp "$WARP_TUNNELS_FILE"
+    fi
+
+    # Если WARP-туннелей больше нет — отключаем службу
+    if [[ ! -s "$WARP_TUNNELS_FILE" ]]; then
+        systemctl disable --now wg-quick@wgcf > /dev/null 2>&1
+    fi
+    netfilter-persistent save > /dev/null
+}
+
+manage_warp() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- 🌐 Управление Cloudflare WARP ---${NC}\n"
+
+        local warp_status
+        warp_status=$(get_warp_status)
+        local status_color="$RED"
+        [[ "$warp_status" == "ПОДКЛЮЧЕН" ]] && status_color="$GREEN"
+        [[ "$warp_status" == "НЕ УСТАНОВЛЕН" ]] && status_color="$YELLOW"
+        echo -e "Статус WARP : ${status_color}${warp_status}${NC}"
+
+        local warp_count=0
+        [[ -f "$WARP_TUNNELS_FILE" ]] && warp_count=$(grep -c . "$WARP_TUNNELS_FILE" 2>/dev/null || echo 0)
+        echo -e "WARP-туннелей: ${CYAN}${warp_count}${NC}\n"
+
+        if ! check_warp_installed; then
+            echo -e "1) ${GREEN}Установить${NC} и настроить WARP"
+        elif systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
+            echo -e "1) ${RED}Отключить${NC} WARP"
+        else
+            echo -e "1) ${GREEN}Подключить${NC} WARP"
+        fi
+        echo -e "2) Показать туннели через WARP"
+        echo -e "0) Назад"
+
+        read -p "Ваш выбор: " choice
+        case $choice in
+            1)
+                if ! check_warp_installed; then
+                    install_warp
+                elif systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
+                    systemctl stop wg-quick@wgcf
+                    echo -e "${GREEN}[OK] WARP отключён.${NC}"
+                else
+                    systemctl start wg-quick@wgcf && \
+                        echo -e "${GREEN}[OK] WARP подключён.${NC}" || \
+                        echo -e "${RED}[ERROR] Не удалось запустить WARP.${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+            2)
+                echo -e "\n${CYAN}Туннели с маршрутизацией через WARP:${NC}"
+                if [[ -f "$WARP_TUNNELS_FILE" ]] && [[ -s "$WARP_TUNNELS_FILE" ]]; then
+                    while IFS= read -r tid; do
+                        echo -e "  ${WHITE}$tid${NC}"
+                    done < "$WARP_TUNNELS_FILE"
+                else
+                    echo -e "${YELLOW}Нет активных WARP-туннелей.${NC}"
+                fi
+                read -p "Нажмите Enter..."
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
 flush_rules_safe() {
     echo -e "\n${RED}!!! ВНИМАНИЕ: СИСТЕМНЫЙ СБРОС !!!${NC}"
     read -p "Будут удалены ВСЕ правила маршрутизации и задачи мониторинга. Подтвердить? (y/n): " confirm
@@ -645,6 +884,9 @@ flush_rules_safe() {
         netfilter-persistent save > /dev/null
         crontab -l 2>/dev/null | grep -v "gokaskad watchdog" | crontab -
         rm -f /tmp/gokaskad_wd_*.state
+        # Очистка WARP
+        > "$WARP_TUNNELS_FILE" 2>/dev/null
+        systemctl disable --now wg-quick@wgcf > /dev/null 2>&1
         echo -e "${GREEN}[SUCCESS] Очистка инфраструктуры завершена.${NC}"
     fi
     read -p "Нажмите Enter..."
@@ -868,6 +1110,7 @@ show_menu() {
         echo -e "7) 🤖 Настройки ${YELLOW}Telegram-бота${NC} (Уведомления)"
         echo -e "8) 🛡 Управление ${CYAN}мониторингом туннелей${NC} (Watchdog)"
         echo -e "9) 📦 Резервное копирование ${WHITE}(Backup & Restore)${NC}"
+        echo -e "10) 🌐 Управление ${CYAN}Cloudflare WARP${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -882,6 +1125,7 @@ show_menu() {
             7) manage_tg_bot ;;
             8) manage_watchdog ;;
             9) manage_backup ;;
+            10) manage_warp ;;
             0) exit 0 ;;
             *) ;;
         esac

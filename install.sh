@@ -862,6 +862,71 @@ remove_warp_mark() {
     netfilter-persistent save > /dev/null
 }
 
+import_warp_config() {
+    clear
+    echo -e "${MAGENTA}--- 📥 Ручной импорт конфигурации WARP ---${NC}\n"
+    echo -e "${YELLOW}Используйте этот способ если сервер не может подключиться к api.cloudflareclient.com${NC}"
+    echo -e "${YELLOW}(характерно для российских VPS-провайдеров).${NC}\n"
+
+    echo -e "${CYAN}Шаг 1.${NC} На вашей локальной машине (где Cloudflare доступен) выполните:\n"
+    echo -e "  ${WHITE}--- Windows (PowerShell) ---${NC}"
+    echo -e '  $v = ((Invoke-WebRequest "https://github.com/ViRb3/wgcf/releases/latest" -MaximumRedirection 0 -EA SilentlyContinue).Headers.Location -replace ".*/v","")'
+    echo -e '  Invoke-WebRequest "https://github.com/ViRb3/wgcf/releases/download/v$v/wgcf_${v}_windows_amd64.exe" -OutFile wgcf.exe'
+    echo -e '  .\wgcf.exe register --accept-tos'
+    echo -e '  .\wgcf.exe generate'
+    echo -e "  ${WHITE}# Файл wgcf-profile.conf появится в текущей папке${NC}\n"
+    echo -e "  ${WHITE}--- Linux / macOS ---${NC}"
+    echo -e '  VER=$(curl -fsSL -o /dev/null -w "%{url_effective}" https://github.com/ViRb3/wgcf/releases/latest | grep -oP "v\K[^/]+")'
+    echo -e '  curl -fsSL "https://github.com/ViRb3/wgcf/releases/download/v${VER}/wgcf_${VER}_linux_amd64" -o wgcf'
+    echo -e '  chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate'
+    echo -e "  ${WHITE}# Файл wgcf-profile.conf появится в текущей папке${NC}\n"
+
+    echo -e "${CYAN}Шаг 2.${NC} Загрузите файл на сервер:\n"
+    echo -e "  ${WHITE}scp wgcf-profile.conf root@$(hostname -I | awk '{print $1}'):/root/${NC}\n"
+
+    echo -e "${CYAN}Шаг 3.${NC} Нажмите Enter когда файл будет загружен в ${WHITE}/root/wgcf-profile.conf${NC}"
+    read -p ""
+
+    if [[ ! -f /root/wgcf-profile.conf ]]; then
+        echo -e "${RED}[ОШИБКА] Файл /root/wgcf-profile.conf не найден.${NC}"
+        read -p "Нажмите Enter..."; return 1
+    fi
+
+    # Минимальная валидация — должен быть WireGuard-конфиг
+    if ! grep -q "\[Interface\]" /root/wgcf-profile.conf || \
+       ! grep -q "\[Peer\]" /root/wgcf-profile.conf; then
+        echo -e "${RED}[ОШИБКА] Файл не является валидным WireGuard-конфигом.${NC}"
+        read -p "Нажмите Enter..."; return 1
+    fi
+
+    echo -e "${YELLOW}[*] Установка wireguard-tools...${NC}"
+    apt-get install -y wireguard-tools > /dev/null 2>&1 || {
+        echo -e "${RED}[ERROR] Не удалось установить wireguard-tools.${NC}"; return 1
+    }
+
+    mkdir -p /etc/wireguard
+    echo -e "${YELLOW}[*] Настройка изолированной таблицы маршрутизации (table $WARP_TABLE)...${NC}"
+    while IFS= read -r line; do
+        echo "$line"
+        if [[ "$line" == "[Interface]" ]]; then
+            echo "Table = $WARP_TABLE"
+            echo "PostUp = ip rule add fwmark $WARP_MARK table $WARP_TABLE priority 100 2>/dev/null || true"
+            echo "PostDown = ip rule del fwmark $WARP_MARK table $WARP_TABLE 2>/dev/null || true"
+        fi
+    done < /root/wgcf-profile.conf | grep -v "^DNS" > "$WARP_CONF"
+    chmod 600 "$WARP_CONF"
+    rm -f /root/wgcf-profile.conf
+
+    systemctl enable --now wg-quick@wgcf > /dev/null 2>&1
+    sleep 2
+    if ! systemctl is-active --quiet wg-quick@wgcf; then
+        echo -e "${RED}[ERROR] WARP-интерфейс не поднялся. Проверьте: systemctl status wg-quick@wgcf${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[OK] WARP успешно установлен через ручной импорт!${NC}"
+    return 0
+}
+
 manage_warp() {
     while true; do
         clear
@@ -879,13 +944,15 @@ manage_warp() {
         echo -e "WARP-туннелей: ${CYAN}${warp_count}${NC}\n"
 
         if ! check_warp_installed; then
-            echo -e "1) ${GREEN}Установить${NC} и настроить WARP"
+            echo -e "1) ${GREEN}Установить${NC} WARP (авто — требует доступ к Cloudflare)"
+            echo -e "2) ${CYAN}Импортировать${NC} конфиг вручную (для серверов с ограниченным доступом)"
         elif systemctl is-active --quiet wg-quick@wgcf 2>/dev/null; then
             echo -e "1) ${RED}Отключить${NC} WARP"
+            echo -e "2) Показать туннели через WARP"
         else
             echo -e "1) ${GREEN}Подключить${NC} WARP"
+            echo -e "2) Показать туннели через WARP"
         fi
-        echo -e "2) Показать туннели через WARP"
         echo -e "0) Назад"
 
         read -p "Ваш выбор: " choice
@@ -904,13 +971,17 @@ manage_warp() {
                 read -p "Нажмите Enter..."
                 ;;
             2)
-                echo -e "\n${CYAN}Туннели с маршрутизацией через WARP:${NC}"
-                if [[ -f "$WARP_TUNNELS_FILE" ]] && [[ -s "$WARP_TUNNELS_FILE" ]]; then
-                    while IFS= read -r tid; do
-                        echo -e "  ${WHITE}$tid${NC}"
-                    done < "$WARP_TUNNELS_FILE"
+                if ! check_warp_installed; then
+                    import_warp_config
                 else
-                    echo -e "${YELLOW}Нет активных WARP-туннелей.${NC}"
+                    echo -e "\n${CYAN}Туннели с маршрутизацией через WARP:${NC}"
+                    if [[ -f "$WARP_TUNNELS_FILE" ]] && [[ -s "$WARP_TUNNELS_FILE" ]]; then
+                        while IFS= read -r tid; do
+                            echo -e "  ${WHITE}$tid${NC}"
+                        done < "$WARP_TUNNELS_FILE"
+                    else
+                        echo -e "${YELLOW}Нет активных WARP-туннелей.${NC}"
+                    fi
                 fi
                 read -p "Нажмите Enter..."
                 ;;

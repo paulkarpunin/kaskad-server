@@ -738,21 +738,48 @@ install_warp() {
     }
 
     echo -e "${YELLOW}[*] Загрузка wgcf (WARP WireGuard configurator)...${NC}"
-    local ARCH
+    local ARCH ARCH_TAG WGCF_URL
     ARCH=$(uname -m)
-    local WGCF_BIN="wgcf_linux_amd64"
-    [[ "$ARCH" == "aarch64" ]] && WGCF_BIN="wgcf_linux_arm64"
-    if ! curl -sL "https://github.com/ViRb3/wgcf/releases/latest/download/${WGCF_BIN}" \
-            -o /usr/local/bin/wgcf; then
+    ARCH_TAG="amd64"
+    [[ "$ARCH" == "aarch64" ]] && ARCH_TAG="arm64"
+
+    # Получаем актуальный URL через GitHub API (файлы называются wgcf_VERSION_linux_ARCH)
+    WGCF_URL=$(curl -s "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
+        | grep -oP '"browser_download_url": "\K[^"]+' \
+        | grep "linux_${ARCH_TAG}" | head -n1)
+
+    if [[ -z "$WGCF_URL" ]]; then
+        echo -e "${RED}[ERROR] Не удалось получить URL загрузки wgcf с GitHub.${NC}"; return 1
+    fi
+
+    if ! curl -sL "$WGCF_URL" -o /usr/local/bin/wgcf; then
         echo -e "${RED}[ERROR] Не удалось загрузить wgcf.${NC}"; return 1
     fi
     chmod +x /usr/local/bin/wgcf
 
+    # Проверяем что скачан валидный бинарь, а не HTML-страница ошибки
+    if ! /usr/local/bin/wgcf --version > /dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Скачанный файл wgcf повреждён или несовместим с архитектурой ${ARCH}.${NC}"
+        rm -f /usr/local/bin/wgcf
+        return 1
+    fi
+
     echo -e "${YELLOW}[*] Регистрация бесплатного WARP-аккаунта...${NC}"
     mkdir -p /etc/wireguard
     cd /etc/wireguard || return 1
-    wgcf register --accept-tos > /dev/null 2>&1
-    wgcf generate > /dev/null 2>&1
+
+    local WGCF_ERR="/tmp/gokaskad_wgcf_err"
+    if ! wgcf register --accept-tos > /dev/null 2>"$WGCF_ERR"; then
+        echo -e "${RED}[ERROR] wgcf register завершился с ошибкой:${NC}"
+        cat "$WGCF_ERR"; rm -f "$WGCF_ERR"; return 1
+    fi
+
+    echo -e "${YELLOW}[*] Генерация конфигурации WireGuard...${NC}"
+    if ! wgcf generate > /dev/null 2>"$WGCF_ERR"; then
+        echo -e "${RED}[ERROR] wgcf generate завершился с ошибкой:${NC}"
+        cat "$WGCF_ERR"; rm -f "$WGCF_ERR"; return 1
+    fi
+    rm -f "$WGCF_ERR"
 
     if [[ ! -f /etc/wireguard/wgcf-profile.conf ]]; then
         echo -e "${RED}[ERROR] Конфигурация WARP не была создана.${NC}"; return 1

@@ -19,12 +19,12 @@
 
 Для развертывания системы на чистом сервере выполните следующую команду. Конвейер автоматически загрузит последнюю версию из ветки `main`, установит зависимости (включая `jq` и `netfilter-persistent`) и запустит главное меню конфигуратора:
 ```
-wget -O install.sh https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh && chmod +x install.sh && ./install.sh
+wget -O install.sh https://raw.githubusercontent.com/paulkarpunin/kaskad-server/dev_cd/install.sh && chmod +x install.sh && ./install.sh
 ```
 или
 
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/paulkarpunin/kaskad-server/dev_cd/install.sh)
 ```
 
 ## ⚙️ Системные требования:

@@ -66,18 +66,18 @@ EOF
 
     export DEBIAN_FRONTEND=noninteractive
     local REQUIRED_PKGS=("iptables-persistent" "netfilter-persistent" "curl" "jq")
-    local MISSING_PKGS=""
+    local MISSING_PKGS=()
 
     for pkg in "${REQUIRED_PKGS[@]}"; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            MISSING_PKGS="$MISSING_PKGS $pkg"
+            MISSING_PKGS+=("$pkg")
         fi
     done
 
-    if [[ -n "$MISSING_PKGS" ]]; then
-        echo -e "${YELLOW}[*] Инсталляция зависимостей:$MISSING_PKGS${NC}"
+    if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[*] Инсталляция зависимостей: ${MISSING_PKGS[*]}${NC}"
         apt-get update -y > /dev/null
-        apt-get install -y $MISSING_PKGS > /dev/null
+        apt-get install -y "${MISSING_PKGS[@]}" > /dev/null
     fi
 }
 
@@ -87,7 +87,8 @@ generate_status_report() {
     local uptime_str=$(echo "$uptime_raw" | sed 's/up //')
     local cores=$(nproc)
     local cpu_usage=$(grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {printf "%.1f", usage}')
-    local load=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
+    local load
+    load=$(awk '{print $1, $2, $3}' /proc/loadavg)
     local ram_info=$(free -m | awk '/Mem:/ {print $2, $3}')
     local ram_total=$(echo "$ram_info" | awk '{print $1}')
     local ram_used=$(echo "$ram_info" | awk '{print $2}')
@@ -237,11 +238,13 @@ run_tg_listener() {
                         "/delete")
                             if [[ -z "$ARG" ]]; then
                                 tg_reply "⚠️ Используйте: <code>/delete [ID_ТУННЕЛЯ]</code>"
+                            elif [[ ! "$ARG" =~ ^gokaskad_[a-z]+_[0-9]+$ ]]; then
+                                tg_reply "❌ Некорректный ID туннеля. Формат: <code>gokaskad_tcp_443</code>"
                             else
-                                if iptables-save | grep -q "$ARG"; then
-                                    iptables-save | grep -v "$ARG" | iptables-restore
+                                if iptables-save | grep -Fq "$ARG"; then
+                                    iptables-save | grep -Fv "$ARG" | iptables-restore
                                     netfilter-persistent save > /dev/null
-                                    crontab -l 2>/dev/null | grep -v "$ARG" | crontab -
+                                    crontab -l 2>/dev/null | grep -Fv "$ARG" | crontab -
                                     rm -f "/tmp/gokaskad_wd_${ARG}.state"
                                     tg_reply "✅ Туннель <code>$ARG</code> успешно демаршрутизирован."
                                 else
@@ -255,14 +258,20 @@ run_tg_listener() {
                             
                             # Обновленная ссылка на новый репозиторий kaskad-server
                             if curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "$TMP_FILE"; then
-                                if grep -q "#!/bin/bash" "$TMP_FILE"; then
+                                local MIN_SIZE=10240  # минимум ~10KB — защита от пустого/обрезанного файла
+                                local file_size
+                                file_size=$(wc -c < "$TMP_FILE")
+                                if grep -q "#!/bin/bash" "$TMP_FILE" && \
+                                   (( file_size >= MIN_SIZE )) && \
+                                   bash -n "$TMP_FILE" 2>/dev/null; then
                                     cat "$TMP_FILE" > "/usr/local/bin/gokaskad"
                                     chmod +x "/usr/local/bin/gokaskad"
                                     rm -f "$TMP_FILE"
                                     tg_reply "✅ Обновление установлено! Выполняется асинхронный перезапуск демона..."
                                     (sleep 2 && systemctl restart gokaskad-bot.service) &
                                 else
-                                    tg_reply "❌ Сбой: Скачанный файл не прошел валидацию."
+                                    rm -f "$TMP_FILE"
+                                    tg_reply "❌ Сбой: Скачанный файл не прошел валидацию (shebang, размер или синтаксис bash)."
                                 fi
                             else
                                 tg_reply "❌ Ошибка загрузки с GitHub."
@@ -293,10 +302,12 @@ run_watchdog() {
     local DEST=$(echo "$RULE" | grep -oP '(?<=--to-destination )[\d\.:]+')
     local TARGET_IP="${DEST%:*}"
 
-    local PING_OUT=$(ping -c 3 -q -W 2 "$TARGET_IP" 2>/dev/null)
+    local PING_OUT
+    PING_OUT=$(ping -c 3 -q -W 2 "$TARGET_IP" 2>/dev/null)
+    local PING_STATUS=$?
     local AVG_PING=9999
-    
-    if [[ $? -eq 0 ]]; then
+
+    if [[ $PING_STATUS -eq 0 ]]; then
         AVG_PING=$(echo "$PING_OUT" | awk -F'/' 'END{print $5}' | cut -d. -f1)
         [[ -z "$AVG_PING" ]] && AVG_PING=9999
     fi
@@ -379,19 +390,39 @@ manage_backup() {
                     if [[ "$line" == "[CRON]" ]]; then section="cron"; continue; fi
                     
                     if [[ "$section" == "config" ]]; then
-                        echo "$line" >> "$WATCHDOG_CONF"
+                        # Разрешаем только известные ключи вида KEY="value" без спецсимволов
+                        if [[ "$line" =~ ^(TG_BOT_TOKEN|TG_CHAT_ID|TG_ALERTS_ENABLED)=\"[^\"]*\"$ ]]; then
+                            echo "$line" >> "$WATCHDOG_CONF"
+                        fi
                     elif [[ "$section" == "tunnels" ]]; then
-                        local proto=$(echo "$line" | awk '{print $1}')
-                        local in_port=$(echo "$line" | awk '{print $2}')
-                        local out_port=$(echo "$line" | awk '{print $3}')
-                        local target_ip=$(echo "$line" | awk '{print $4}')
-                        apply_iptables_rules "$proto" "$in_port" "$out_port" "$target_ip" "Restored_Tunnel" "1"
+                        local proto in_port out_port target_ip
+                        proto=$(echo "$line" | awk '{print $1}')
+                        in_port=$(echo "$line" | awk '{print $2}')
+                        out_port=$(echo "$line" | awk '{print $3}')
+                        target_ip=$(echo "$line" | awk '{print $4}')
+                        # Валидируем формат перед применением правил
+                        if [[ "$proto" =~ ^(tcp|udp)$ ]] && \
+                           [[ "$in_port" =~ ^[0-9]+$ ]] && (( in_port >= 1 && in_port <= 65535 )) && \
+                           [[ "$out_port" =~ ^[0-9]+$ ]] && (( out_port >= 1 && out_port <= 65535 )) && \
+                           validate_ipv4 "$target_ip"; then
+                            apply_iptables_rules "$proto" "$in_port" "$out_port" "$target_ip" "Restored_Tunnel" "1"
+                        else
+                            echo -e "${RED}[WARN] Пропущена некорректная запись туннеля: $line${NC}"
+                        fi
                     elif [[ "$section" == "cron" ]]; then
-                        local tid=$(echo "$line" | awk '{print $1}')
-                        local thresh=$(echo "$line" | awk '{print $2}')
-                        local period=$(echo "$line" | awk '{print $3}')
-                        local CRON_CMD="/usr/local/bin/gokaskad watchdog \"$tid\" \"$thresh\""
-                        (crontab -l 2>/dev/null | grep -v "$tid"; echo "*/$period * * * * $CRON_CMD") | crontab -
+                        local tid thresh period
+                        tid=$(echo "$line" | awk '{print $1}')
+                        thresh=$(echo "$line" | awk '{print $2}')
+                        period=$(echo "$line" | awk '{print $3}')
+                        # Разрешаем только валидные ID туннелей и числовые параметры
+                        if [[ "$tid" =~ ^gokaskad_[a-z]+_[0-9]+$ ]] && \
+                           [[ "$thresh" =~ ^[0-9]+$ ]] && \
+                           [[ "$period" =~ ^[0-9]+$ ]]; then
+                            local CRON_CMD="/usr/local/bin/gokaskad watchdog \"$tid\" \"$thresh\""
+                            (crontab -l 2>/dev/null | grep -Fv "$tid"; echo "*/$period * * * * $CRON_CMD") | crontab -
+                        else
+                            echo -e "${RED}[WARN] Пропущена некорректная запись cron: $line${NC}"
+                        fi
                     fi
                 done < "$file_path"
                 
@@ -435,7 +466,8 @@ apply_iptables_rules() {
     local SILENT=$6
 
     local CASCADE_ID="gokaskad_${PROTO}_${IN_PORT}"
-    local IFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+    local IFACE
+    IFACE=$(ip route get 8.8.8.8 | awk '{print $5}')
     
     if [[ -z "$IFACE" ]]; then
         echo -e "${RED}[ERROR] Системный сбой: Не удалось определить интерфейс!${NC}"

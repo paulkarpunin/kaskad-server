@@ -8,6 +8,7 @@ YELLOW='\033[1;33m'
 MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 NC='\033[0m'
+SCRIPT_VERSION="1.1"
 
 # --- СИСТЕМНЫЕ ДИРЕКТОРИИ ---
 CONFIG_DIR="/etc/gokaskad"
@@ -193,10 +194,13 @@ run_tg_listener() {
                     
                     case "$CMD" in
                         "/start" | "/help")
-                            local help_msg="🤖 <b>Панель управления gokaskad</b>%0A%0A"
+                            local help_msg="🤖 <b>Панель управления gokaskad</b> v${SCRIPT_VERSION}%0A%0A"
                             help_msg+="Доступные команды:%0A"
                             help_msg+="/status — Нагрузка на сервер (CPU, RAM)%0A"
+                            help_msg+="/ip — Внешний IP-адрес сервера%0A"
                             help_msg+="/list — Список активных туннелей%0A"
+                            help_msg+="/traffic — Статистика трафика по туннелям%0A"
+                            help_msg+="/ping <code>[ID]</code> — Проверить связь с узлом туннеля%0A"
                             help_msg+="/delete <code>[ID]</code> — Удалить туннель%0A"
                             help_msg+="/backup — Выгрузить резервную копию настроек%0A"
                             help_msg+="/update — Обновление скрипта с GitHub"
@@ -205,6 +209,64 @@ run_tg_listener() {
                         "/status")
                             local REPORT=$(generate_status_report)
                             tg_reply "$REPORT"
+                            ;;
+                        "/ip")
+                            local ext_ip
+                            ext_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "Не удалось определить")
+                            tg_reply "🌐 <b>Внешний IP сервера:</b> <code>${ext_ip}</code>"
+                            ;;
+                        "/ping")
+                            if [[ -z "$ARG" ]]; then
+                                tg_reply "⚠️ Используйте: <code>/ping [ID_ТУННЕЛЯ]</code>"
+                            elif [[ ! "$ARG" =~ ^gokaskad_[a-z]+_[0-9]+$ ]]; then
+                                tg_reply "❌ Некорректный ID туннеля. Формат: <code>gokaskad_tcp_443</code>"
+                            else
+                                local RULE
+                                RULE=$(iptables-save | grep -F "$ARG" | grep "\-j DNAT" | head -n 1)
+                                if [[ -z "$RULE" ]]; then
+                                    tg_reply "❌ Туннель <code>$ARG</code> не найден."
+                                else
+                                    local DEST TARGET_IP
+                                    DEST=$(echo "$RULE" | grep -oP '(?<=--to-destination )[\d\.:]+')
+                                    TARGET_IP="${DEST%:*}"
+                                    tg_reply "⏳ Проверка связи с <code>$TARGET_IP</code>..."
+                                    local PING_OUT PING_STATUS AVG_PING=9999
+                                    PING_OUT=$(ping -c 3 -q -W 2 "$TARGET_IP" 2>/dev/null)
+                                    PING_STATUS=$?
+                                    if [[ $PING_STATUS -eq 0 ]]; then
+                                        AVG_PING=$(echo "$PING_OUT" | awk -F'/' 'END{print $5}' | cut -d. -f1)
+                                        [[ -z "$AVG_PING" ]] && AVG_PING=9999
+                                    fi
+                                    local ping_msg="📡 <b>Результат проверки:</b>%0A"
+                                    ping_msg+="Туннель: <code>$ARG</code>%0A"
+                                    ping_msg+="Сервер: <code>$TARGET_IP</code>%0A"
+                                    if (( AVG_PING == 9999 )); then
+                                        ping_msg+="Статус: <b>❌ Недоступен (100% loss)</b>"
+                                    else
+                                        ping_msg+="Средний пинг: <b>${AVG_PING} мс</b>"
+                                    fi
+                                    tg_reply "$ping_msg"
+                                fi
+                            fi
+                            ;;
+                        "/traffic")
+                            local traffic_msg="📊 <b>Статистика трафика:</b>%0A%0A"
+                            local found=0
+                            while IFS= read -r line; do
+                                local l_id
+                                l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
+                                if [[ -n "$l_id" ]]; then
+                                    local stats
+                                    stats=$(iptables -t nat -L PREROUTING -v -n 2>/dev/null | grep -F "$l_id" | awk '{printf "%s пкт, %s байт", $1, $2}')
+                                    traffic_msg+="<code>$l_id</code>%0A${stats:-нет данных}%0A%0A"
+                                    found=1
+                                fi
+                            done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
+                            if [[ $found -eq 0 ]]; then
+                                tg_reply "Туннелей не найдено."
+                            else
+                                tg_reply "$traffic_msg"
+                            fi
                             ;;
                         "/list")
                             local list_msg="🌐 <b>Активные переадресации:</b>%0A%0A"
@@ -253,22 +315,28 @@ run_tg_listener() {
                             fi
                             ;;
                         "/update")
-                            tg_reply "🔄 <b>Инициализация обновления...</b>"
+                            tg_reply "🔄 <b>Инициализация обновления...</b> (текущая версия: v${SCRIPT_VERSION})"
                             local TMP_FILE="/tmp/gokaskad_update.sh"
-                            
-                            # Обновленная ссылка на новый репозиторий kaskad-server
+
                             if curl -sL "https://raw.githubusercontent.com/paulkarpunin/kaskad-server/main/install.sh" -o "$TMP_FILE"; then
-                                local MIN_SIZE=10240  # минимум ~10KB — защита от пустого/обрезанного файла
+                                local MIN_SIZE=10240
                                 local file_size
                                 file_size=$(wc -c < "$TMP_FILE")
                                 if grep -q "#!/bin/bash" "$TMP_FILE" && \
                                    (( file_size >= MIN_SIZE )) && \
                                    bash -n "$TMP_FILE" 2>/dev/null; then
-                                    cat "$TMP_FILE" > "/usr/local/bin/gokaskad"
-                                    chmod +x "/usr/local/bin/gokaskad"
-                                    rm -f "$TMP_FILE"
-                                    tg_reply "✅ Обновление установлено! Выполняется асинхронный перезапуск демона..."
-                                    (sleep 2 && systemctl restart gokaskad-bot.service) &
+                                    local NEW_VERSION
+                                    NEW_VERSION=$(grep -oP '^SCRIPT_VERSION="\K[^"]+' "$TMP_FILE" 2>/dev/null || echo "unknown")
+                                    if [[ "$NEW_VERSION" == "$SCRIPT_VERSION" ]]; then
+                                        rm -f "$TMP_FILE"
+                                        tg_reply "✅ Уже установлена актуальная версия: <b>v${SCRIPT_VERSION}</b>"
+                                    else
+                                        cat "$TMP_FILE" > "/usr/local/bin/gokaskad"
+                                        chmod +x "/usr/local/bin/gokaskad"
+                                        rm -f "$TMP_FILE"
+                                        tg_reply "✅ Обновление с v${SCRIPT_VERSION} → v${NEW_VERSION} установлено! Выполняется перезапуск..."
+                                        (sleep 2 && systemctl restart gokaskad-bot.service) &
+                                    fi
                                 else
                                     rm -f "$TMP_FILE"
                                     tg_reply "❌ Сбой: Скачанный файл не прошел валидацию (shebang, размер или синтаксис bash)."
@@ -448,13 +516,21 @@ configure_rule() {
         if validate_ipv4 "$TARGET_IP"; then break; fi
         echo -e "${RED}[ERROR] Некорректный формат IPv4-адреса.${NC}"
     done
+
+    local IN_PORT OUT_PORT
     while true; do
-        read -p "Введите Порт (одинаковый для входа и выхода): " PORT
-        if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -le 65535 ]; then break; fi
+        read -p "Входящий порт (на этом сервере): " IN_PORT
+        if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && (( IN_PORT >= 1 && IN_PORT <= 65535 )); then break; fi
+        echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
+    done
+    while true; do
+        read -p "Исходящий порт (на зарубежном сервере) [Enter = $IN_PORT]: " OUT_PORT
+        [[ -z "$OUT_PORT" ]] && OUT_PORT="$IN_PORT"
+        if [[ "$OUT_PORT" =~ ^[0-9]+$ ]] && (( OUT_PORT >= 1 && OUT_PORT <= 65535 )); then break; fi
         echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
     done
 
-    apply_iptables_rules "$PROTO" "$PORT" "$PORT" "$TARGET_IP" "$NAME" "0"
+    apply_iptables_rules "$PROTO" "$IN_PORT" "$OUT_PORT" "$TARGET_IP" "$NAME" "0"
 }
 
 apply_iptables_rules() {

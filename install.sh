@@ -19,6 +19,11 @@ WARP_TUNNELS_FILE="$CONFIG_DIR/warp_tunnels"
 WARP_MARK=200
 WARP_TABLE=200
 
+RELAY_CONF="/etc/wireguard/gokaskad-relay.conf"
+RELAY_TUNNELS_FILE="$CONFIG_DIR/relay_tunnels"
+RELAY_MARK=201
+RELAY_TABLE=201
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 save_rules() {
     if command -v netfilter-persistent &>/dev/null; then
@@ -160,6 +165,10 @@ generate_backup_file() {
 
     echo "[WARP]" >> "$file"
     [[ -f "$WARP_TUNNELS_FILE" ]] && grep -v '^$' "$WARP_TUNNELS_FILE" >> "$file"
+    echo "" >> "$file"
+
+    echo "[RELAY]" >> "$file"
+    [[ -f "$RELAY_TUNNELS_FILE" ]] && grep -v '^$' "$RELAY_TUNNELS_FILE" >> "$file"
 }
 
 # --- ИНТЕРАКТИВНЫЙ БОТ (СЛУШАТЕЛЬ) ---
@@ -345,6 +354,8 @@ run_tg_listener() {
                                     d_port=$(echo "$ARG" | awk -F'_' '{print $3}')
                                     grep -Fxq "$ARG" "$WARP_TUNNELS_FILE" 2>/dev/null && \
                                         remove_warp_mark "$ARG" "$d_proto" "$d_port"
+                                    grep -Fxq "$ARG" "$RELAY_TUNNELS_FILE" 2>/dev/null && \
+                                        remove_relay_mark "$ARG" "$d_proto" "$d_port"
                                     iptables-save | grep -Fv "$ARG" | iptables-restore
                                     save_rules
                                     crontab -l 2>/dev/null | grep -Fv "$ARG" | crontab -
@@ -498,6 +509,7 @@ manage_backup() {
                     if [[ "$line" == "[TUNNELS]" ]]; then section="tunnels"; continue; fi
                     if [[ "$line" == "[CRON]" ]]; then section="cron"; continue; fi
                     if [[ "$line" == "[WARP]" ]]; then section="warp"; continue; fi
+                    if [[ "$line" == "[RELAY]" ]]; then section="relay"; continue; fi
                     
                     if [[ "$section" == "config" ]]; then
                         # Разрешаем только известные ключи вида KEY="value" без спецсимволов
@@ -544,6 +556,19 @@ manage_backup() {
                                 apply_warp_mark "$line" "$w_proto" "$w_port"
                             else
                                 echo -e "${YELLOW}[WARN] WARP не установлен — пропускаем метку для $line.${NC}"
+                            fi
+                        fi
+                    elif [[ "$section" == "relay" ]]; then
+                        if [[ "$line" =~ ^gokaskad_[a-z]+_[0-9]+$ ]]; then
+                            local r_proto r_port
+                            r_proto=$(echo "$line" | awk -F'_' '{print $2}')
+                            r_port=$(echo "$line" | awk -F'_' '{print $3}')
+                            if check_relay_installed; then
+                                systemctl is-active --quiet wg-quick@gokaskad-relay 2>/dev/null || \
+                                    systemctl start wg-quick@gokaskad-relay > /dev/null 2>&1
+                                apply_relay_mark "$line" "$r_proto" "$r_port"
+                            else
+                                echo -e "${YELLOW}[WARN] Relay не настроен — пропускаем метку для $line.${NC}"
                             fi
                         fi
                     fi
@@ -710,12 +735,13 @@ delete_single_rule() {
 
     local target_id="${RULES_LIST[$rule_num]}"
 
-    # Снять WARP-метку если туннель её использует
     local t_proto t_port
     t_proto=$(echo "$target_id" | awk -F'_' '{print $2}')
     t_port=$(echo "$target_id" | awk -F'_' '{print $3}')
     grep -Fxq "$target_id" "$WARP_TUNNELS_FILE" 2>/dev/null && \
         remove_warp_mark "$target_id" "$t_proto" "$t_port"
+    grep -Fxq "$target_id" "$RELAY_TUNNELS_FILE" 2>/dev/null && \
+        remove_relay_mark "$target_id" "$t_proto" "$t_port"
 
     iptables-save | grep -v "$target_id" | iptables-restore
     save_rules
@@ -1072,6 +1098,290 @@ manage_warp() {
     done
 }
 
+# --- WIREGUARD RELAY ---
+check_relay_installed() {
+    [[ -f "$RELAY_CONF" ]]
+}
+
+get_relay_status() {
+    if ! check_relay_installed; then echo "НЕ НАСТРОЕН"; return; fi
+    if systemctl is-active --quiet wg-quick@gokaskad-relay 2>/dev/null; then
+        echo "ПОДКЛЮЧЕН"
+    else
+        echo "ОТКЛЮЧЕН"
+    fi
+}
+
+setup_relay() {
+    clear
+    echo -e "${MAGENTA}--- 🔗 Настройка WireGuard Relay ---${NC}\n"
+    echo -e "${YELLOW}Relay — исходящий WireGuard-туннель к вашему зарубежному серверу.${NC}"
+    echo -e "${YELLOW}Трафик выбранных каскадов будет выходить через него.${NC}\n"
+
+    if ! command -v wg &>/dev/null; then
+        echo -e "${YELLOW}[*] Установка wireguard-tools...${NC}"
+        apt-get install -y wireguard-tools > /dev/null 2>&1 || {
+            echo -e "${RED}[ERROR] Не удалось установить wireguard-tools.${NC}"
+            read -p "Нажмите Enter..."; return 1
+        }
+    fi
+
+    read -p "IP-адрес зарубежного сервера (Relay): " RELAY_IP
+    if ! validate_ipv4 "$RELAY_IP"; then
+        echo -e "${RED}[ОШИБКА] Неверный IP-адрес.${NC}"
+        read -p "Нажмите Enter..."; return 1
+    fi
+
+    read -p "WireGuard порт на зарубежном сервере [51820]: " RELAY_PORT
+    RELAY_PORT="${RELAY_PORT:-51820}"
+    if ! [[ "$RELAY_PORT" =~ ^[0-9]+$ ]] || (( RELAY_PORT < 1 || RELAY_PORT > 65535 )); then
+        echo -e "${RED}[ОШИБКА] Неверный порт.${NC}"
+        read -p "Нажмите Enter..."; return 1
+    fi
+
+    read -p "Публичный ключ зарубежного сервера: " PEER_PUBKEY
+    if [[ -z "$PEER_PUBKEY" ]]; then
+        echo -e "${RED}[ОШИБКА] Публичный ключ не может быть пустым.${NC}"
+        read -p "Нажмите Enter..."; return 1
+    fi
+
+    local PRIVATE_KEY PUBLIC_KEY
+    PRIVATE_KEY=$(wg genkey)
+    PUBLIC_KEY=$(echo "$PRIVATE_KEY" | wg pubkey)
+
+    mkdir -p /etc/wireguard
+    cat > "$RELAY_CONF" <<EOF
+[Interface]
+PrivateKey = $PRIVATE_KEY
+Address = 10.222.0.2/30
+Table = $RELAY_TABLE
+PostUp = ip rule add fwmark $RELAY_MARK table $RELAY_TABLE priority 101 2>/dev/null || true
+PostDown = ip rule del fwmark $RELAY_MARK table $RELAY_TABLE 2>/dev/null || true
+
+[Peer]
+PublicKey = $PEER_PUBKEY
+Endpoint = $RELAY_IP:$RELAY_PORT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+    chmod 600 "$RELAY_CONF"
+
+    echo -e "\n${GREEN}[OK] Конфигурация создана.${NC}\n"
+    echo -e "${CYAN}══════════════════════════════════════════════════════${NC}"
+    echo -e "${WHITE}Добавьте на зарубежный сервер:${NC}\n"
+    echo -e "1. В конфиг WireGuard (например, /etc/wireguard/wg0.conf) добавьте peer:"
+    echo -e "${WHITE}[Peer]"
+    echo -e "PublicKey = $PUBLIC_KEY"
+    echo -e "AllowedIPs = 10.222.0.2/32${NC}\n"
+    echo -e "2. Разрешите NAT для relay-трафика (выполните на зарубежном сервере):"
+    echo -e "${WHITE}# Замените eth0 на ваш внешний интерфейс"
+    echo -e "iptables -t nat -A POSTROUTING -s 10.222.0.0/30 -o eth0 -j MASQUERADE"
+    echo -e "# Для постоянства:"
+    echo -e "iptables-save > /etc/iptables/rules.v4${NC}\n"
+    echo -e "3. Перезапустите WireGuard на зарубежном сервере:"
+    echo -e "${WHITE}systemctl restart wg-quick@wg0${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════${NC}\n"
+
+    read -p "Нажмите Enter когда настройка на зарубежном сервере завершена..."
+
+    systemctl enable --now wg-quick@gokaskad-relay > /dev/null 2>&1
+    sleep 3
+    if systemctl is-active --quiet wg-quick@gokaskad-relay; then
+        echo -e "${GREEN}[OK] Relay-интерфейс запущен.${NC}"
+        local rx
+        rx=$(wg show gokaskad-relay | grep "transfer" | awk '{print $3}')
+        if [[ -n "$rx" && "$rx" != "0" ]]; then
+            echo -e "${GREEN}[OK] Handshake установлен — трафик идёт.${NC}"
+        else
+            echo -e "${YELLOW}[INFO] Интерфейс запущен. Handshake появится при первом трафике.${NC}"
+        fi
+    else
+        echo -e "${RED}[ERROR] Интерфейс не поднялся. Проверьте: systemctl status wg-quick@gokaskad-relay${NC}"
+    fi
+    read -p "Нажмите Enter..."
+}
+
+apply_relay_mark() {
+    local CASCADE_ID="$1"
+    local PROTO="$2"
+    local IN_PORT="$3"
+
+    iptables -t mangle -D PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_relay" -j MARK --set-mark "$RELAY_MARK" 2>/dev/null
+    iptables -t mangle -A PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_relay" -j MARK --set-mark "$RELAY_MARK"
+
+    touch "$RELAY_TUNNELS_FILE"
+    grep -Fxq "$CASCADE_ID" "$RELAY_TUNNELS_FILE" || echo "$CASCADE_ID" >> "$RELAY_TUNNELS_FILE"
+    save_rules
+}
+
+remove_relay_mark() {
+    local CASCADE_ID="$1"
+    local PROTO="$2"
+    local IN_PORT="$3"
+
+    iptables -t mangle -D PREROUTING -p "$PROTO" --dport "$IN_PORT" \
+        -m comment --comment "${CASCADE_ID}_relay" -j MARK --set-mark "$RELAY_MARK" 2>/dev/null
+
+    if [[ -f "$RELAY_TUNNELS_FILE" ]]; then
+        grep -Fxv "$CASCADE_ID" "$RELAY_TUNNELS_FILE" > /tmp/gokaskad_relay_tmp
+        mv /tmp/gokaskad_relay_tmp "$RELAY_TUNNELS_FILE"
+    fi
+
+    if [[ ! -s "$RELAY_TUNNELS_FILE" ]]; then
+        systemctl disable --now wg-quick@gokaskad-relay > /dev/null 2>&1
+    fi
+    save_rules
+}
+
+toggle_relay_for_tunnels() {
+    if ! check_relay_installed; then
+        echo -e "${RED}[ERROR] Relay не настроен. Сначала настройте Relay.${NC}"
+        read -p "Нажмите Enter..."; return
+    fi
+
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- ⚡ Включить / Выключить Relay для туннеля ---${NC}\n"
+
+        declare -A RTUNNELS
+        local i=1
+
+        while read -r line; do
+            local l_id
+            l_id=$(echo "$line" | grep -oP 'gokaskad_\w+')
+            [[ -z "$l_id" ]] && continue
+            RTUNNELS[$i]="$l_id"
+            local marker
+            if [[ -f "$RELAY_TUNNELS_FILE" ]] && grep -Fxq "$l_id" "$RELAY_TUNNELS_FILE" 2>/dev/null; then
+                marker="${GREEN}● RELAY ВКЛ${NC}"
+            else
+                marker="${YELLOW}○ RELAY ВЫКЛ${NC}"
+            fi
+            echo -e "  ${WHITE}[$i]${NC} $l_id  —  $marker"
+            ((i++))
+        done < <(iptables -t nat -S PREROUTING | grep "gokaskad_")
+
+        if [[ ${#RTUNNELS[@]} -eq 0 ]]; then
+            echo -e "${YELLOW}Активных туннелей не найдено.${NC}"
+            read -p "Нажмите Enter..."; return
+        fi
+
+        echo ""
+        read -p "Введите номер туннеля (0 — назад): " sel
+        [[ "$sel" == "0" || -z "$sel" ]] && unset RTUNNELS && return
+
+        local SELECTED="${RTUNNELS[$sel]}"
+        if [[ -z "$SELECTED" ]]; then
+            echo -e "${RED}Неверный выбор.${NC}"; sleep 1; unset RTUNNELS; continue
+        fi
+
+        local PROTO IN_PORT
+        IFS='_' read -r _ PROTO IN_PORT <<< "$SELECTED"
+
+        if [[ -f "$RELAY_TUNNELS_FILE" ]] && grep -Fxq "$SELECTED" "$RELAY_TUNNELS_FILE" 2>/dev/null; then
+            remove_relay_mark "$SELECTED" "$PROTO" "$IN_PORT"
+            echo -e "\n${GREEN}[OK] Relay отключён для ${WHITE}$SELECTED${NC}."
+        else
+            if ! systemctl is-active --quiet wg-quick@gokaskad-relay 2>/dev/null; then
+                systemctl start wg-quick@gokaskad-relay 2>/dev/null || {
+                    echo -e "${RED}[ERROR] Не удалось запустить Relay-интерфейс.${NC}"
+                    read -p "Нажмите Enter..."; unset RTUNNELS; continue
+                }
+            fi
+            apply_relay_mark "$SELECTED" "$PROTO" "$IN_PORT"
+            echo -e "\n${GREEN}[OK] Relay включён для ${WHITE}$SELECTED${NC}."
+        fi
+        read -p "Нажмите Enter..."
+        unset RTUNNELS
+    done
+}
+
+manage_relay() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- 🔗 Управление WireGuard Relay ---${NC}\n"
+
+        local relay_status
+        relay_status=$(get_relay_status)
+        local status_color="$RED"
+        [[ "$relay_status" == "ПОДКЛЮЧЕН" ]] && status_color="$GREEN"
+        [[ "$relay_status" == "НЕ НАСТРОЕН" ]] && status_color="$YELLOW"
+        echo -e "Статус Relay  : ${status_color}${relay_status}${NC}"
+
+        local relay_count=0
+        [[ -f "$RELAY_TUNNELS_FILE" ]] && relay_count=$(grep -c . "$RELAY_TUNNELS_FILE" 2>/dev/null || echo 0)
+        echo -e "Relay-туннелей: ${CYAN}${relay_count}${NC}\n"
+
+        if ! check_relay_installed; then
+            echo -e "1) ${GREEN}Настроить${NC} Relay (WireGuard к зарубежному серверу)"
+        elif systemctl is-active --quiet wg-quick@gokaskad-relay 2>/dev/null; then
+            echo -e "1) ${RED}Отключить${NC} Relay (глобально)"
+            echo -e "2) Показать туннели через Relay"
+            echo -e "3) ${CYAN}⚡ Включить / выключить${NC} Relay для конкретного туннеля"
+            echo -e "4) ${RED}Удалить${NC} конфигурацию Relay"
+        else
+            echo -e "1) ${GREEN}Подключить${NC} Relay (глобально)"
+            echo -e "2) Показать туннели через Relay"
+            echo -e "3) ${CYAN}⚡ Включить / выключить${NC} Relay для конкретного туннеля"
+            echo -e "4) ${RED}Удалить${NC} конфигурацию Relay"
+        fi
+        echo -e "0) Назад"
+
+        read -p "Ваш выбор: " choice
+        case $choice in
+            1)
+                if ! check_relay_installed; then
+                    setup_relay
+                elif systemctl is-active --quiet wg-quick@gokaskad-relay 2>/dev/null; then
+                    systemctl stop wg-quick@gokaskad-relay
+                    echo -e "${GREEN}[OK] Relay отключён.${NC}"
+                    read -p "Нажмите Enter..."
+                else
+                    systemctl start wg-quick@gokaskad-relay && \
+                        echo -e "${GREEN}[OK] Relay подключён.${NC}" || \
+                        echo -e "${RED}[ERROR] Не удалось запустить Relay.${NC}"
+                    read -p "Нажмите Enter..."
+                fi
+                ;;
+            2)
+                if check_relay_installed; then
+                    echo -e "\n${CYAN}Туннели с маршрутизацией через Relay:${NC}"
+                    if [[ -f "$RELAY_TUNNELS_FILE" ]] && [[ -s "$RELAY_TUNNELS_FILE" ]]; then
+                        while IFS= read -r tid; do
+                            echo -e "  ${WHITE}$tid${NC}"
+                        done < "$RELAY_TUNNELS_FILE"
+                    else
+                        echo -e "${YELLOW}Нет активных Relay-туннелей.${NC}"
+                    fi
+                    read -p "Нажмите Enter..."
+                fi
+                ;;
+            3) toggle_relay_for_tunnels ;;
+            4)
+                if check_relay_installed; then
+                    read -p "Удалить конфигурацию Relay и все связанные правила? (y/n): " confirm
+                    if [[ "$confirm" == "y" ]]; then
+                        systemctl disable --now wg-quick@gokaskad-relay > /dev/null 2>&1
+                        if [[ -f "$RELAY_TUNNELS_FILE" ]]; then
+                            while IFS= read -r tid; do
+                                local rp ri
+                                IFS='_' read -r _ rp ri <<< "$tid"
+                                remove_relay_mark "$tid" "$rp" "$ri"
+                            done < "$RELAY_TUNNELS_FILE"
+                        fi
+                        rm -f "$RELAY_CONF" "$RELAY_TUNNELS_FILE"
+                        echo -e "${GREEN}[OK] Relay полностью удалён.${NC}"
+                    fi
+                    read -p "Нажмите Enter..."
+                fi
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
 flush_rules_safe() {
     echo -e "\n${RED}!!! ВНИМАНИЕ: СИСТЕМНЫЙ СБРОС !!!${NC}"
     read -p "Будут удалены ВСЕ правила маршрутизации и задачи мониторинга. Подтвердить? (y/n): " confirm
@@ -1083,6 +1393,9 @@ flush_rules_safe() {
         # Очистка WARP
         > "$WARP_TUNNELS_FILE" 2>/dev/null
         systemctl disable --now wg-quick@wgcf > /dev/null 2>&1
+        # Очистка Relay
+        > "$RELAY_TUNNELS_FILE" 2>/dev/null
+        systemctl disable --now wg-quick@gokaskad-relay > /dev/null 2>&1
         echo -e "${GREEN}[SUCCESS] Очистка инфраструктуры завершена.${NC}"
     fi
     read -p "Нажмите Enter..."
@@ -1307,6 +1620,7 @@ show_menu() {
         echo -e "8) 🛡 Управление ${CYAN}мониторингом туннелей${NC} (Watchdog)"
         echo -e "9) 📦 Резервное копирование ${WHITE}(Backup & Restore)${NC}"
         echo -e "10) 🌐 Управление ${CYAN}Cloudflare WARP${NC}"
+        echo -e "11) 🔗 Управление ${CYAN}WireGuard Relay${NC} (исходящий туннель)"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -1322,6 +1636,7 @@ show_menu() {
             8) manage_watchdog ;;
             9) manage_backup ;;
             10) manage_warp ;;
+            11) manage_relay ;;
             0) exit 0 ;;
             *) ;;
         esac

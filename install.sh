@@ -1656,4 +1656,10 @@ fi
 
 check_root
 prepare_system
+
+if [[ ! -t 0 ]]; then
+    echo "[ERROR] gokaskad: интерактивное меню требует TTY. Запустите вручную в терминале." >&2
+    exit 1
+fi
+
 show_menu
